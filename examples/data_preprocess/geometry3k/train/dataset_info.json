@@ -1,0 +1,68 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "geometry3k",
+  "dataset_size": 61021152,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/hiyouga/geometry3k@fd21e533e1e50d0662a2bf7b223e60511bd5f8b7/data/train-00000-of-00001.parquet": {
+      "num_bytes": 41542768,
+      "checksum": null
+    },
+    "hf://datasets/hiyouga/geometry3k@fd21e533e1e50d0662a2bf7b223e60511bd5f8b7/data/validation-00000-of-00001.parquet": {
+      "num_bytes": 5885804,
+      "checksum": null
+    },
+    "hf://datasets/hiyouga/geometry3k@fd21e533e1e50d0662a2bf7b223e60511bd5f8b7/data/test-00000-of-00001.parquet": {
+      "num_bytes": 11831222,
+      "checksum": null
+    }
+  },
+  "download_size": 59259794,
+  "features": {
+    "images": {
+      "feature": {
+        "_type": "Image"
+      },
+      "_type": "Sequence"
+    },
+    "problem": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "answer": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 120280946,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 42801456,
+      "num_examples": 2101,
+      "dataset_name": "geometry3k"
+    },
+    "validation": {
+      "name": "validation",
+      "num_bytes": 6001661,
+      "num_examples": 300,
+      "dataset_name": "geometry3k"
+    },
+    "test": {
+      "name": "test",
+      "num_bytes": 12218035,
+      "num_examples": 601,
+      "dataset_name": "geometry3k"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

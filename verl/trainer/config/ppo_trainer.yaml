@@ -252,6 +252,25 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
+  copd:
+    step_advantage_w: 1.0
+    teacher_advantage_w: 1.0
+    mode: "mean_norm" # "mean_norm" or "mean_std_norm"
+    enable_similarity: False
+    similarity_thresh: 0.95
+    selector: "llm" # "stats" or "llm"
+    stats_min_group_size: 2
+    stats_var_quantile: 0.75
+    stats_topk_per_traj: 1
+    stats_below_group_mean_only: True
+    analysis_backend: "azure" # "heuristic", "azure", or "google"
+    analysis_num_workers: 8
+    analysis_max_history_steps: 15
+    analysis_max_completion_tokens: 1024
+    save_analysis: True
+    analysis_dump_dir: null # null -> ${trainer.default_local_dir}/copd_analysis
+    normalize_teacher_adv: False
+    clip_teacher_adv: null
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

@@ -20,7 +20,7 @@ from verl import DataProto
 import uuid
 
 from difflib import SequenceMatcher
-from typing import Sequence, List, Dict, Any
+from typing import Sequence, List, Dict, Any, Optional
 
 
 """
@@ -131,6 +131,120 @@ def compute_step_discounted_returns(batch: DataProto, gamma: float):
     all_returns = torch.tensor(all_returns, dtype=torch.float32, device=batch.batch['input_ids'].device)
     return all_returns
 
+
+def _mode_to_remove_std(mode: str) -> bool:
+    """Map normalization mode to whether std normalization should be removed."""
+    if mode == "mean_std_norm":
+        return False
+    if mode == "mean_norm":
+        return True
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def _broadcast_mask_to_response(
+    mask: Optional[torch.Tensor | np.ndarray | Sequence],
+    response_mask: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    """
+    Broadcast a sample-level or token-level mask to match ``response_mask``.
+    """
+    if mask is None:
+        return torch.ones_like(response_mask, dtype=response_mask.dtype)
+
+    if isinstance(mask, np.ndarray):
+        mask = torch.from_numpy(mask)
+    elif not torch.is_tensor(mask):
+        mask = torch.as_tensor(mask)
+
+    mask = mask.to(device=response_mask.device)
+
+    if mask.dim() == 1:
+        if mask.shape[0] != response_mask.shape[0]:
+            raise ValueError(
+                f"{name} batch dimension mismatch: {mask.shape[0]} vs {response_mask.shape[0]}"
+            )
+        mask = mask.unsqueeze(-1).expand_as(response_mask)
+    elif mask.dim() == 2:
+        if mask.shape == response_mask.shape:
+            pass
+        elif mask.shape[0] == response_mask.shape[0] and mask.shape[1] == 1:
+            mask = mask.expand_as(response_mask)
+        else:
+            raise ValueError(
+                f"{name} shape {tuple(mask.shape)} is not compatible with response_mask "
+                f"shape {tuple(response_mask.shape)}"
+            )
+    else:
+        raise ValueError(f"{name} must be 1D or 2D, got shape {tuple(mask.shape)}")
+
+    return mask.to(dtype=response_mask.dtype)
+
+
+def compute_teacher_token_advantage(
+    response_mask: torch.Tensor,
+    teacher_log_prob: Optional[torch.Tensor] = None,
+    old_log_prob: Optional[torch.Tensor] = None,
+    critical_step_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
+    normalize: bool = False,
+    clip_range: Optional[float] = None,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Compute token-level teacher advantage for COPD.
+
+    The default teacher signal is the detached log-prob improvement under the
+    enhanced prompt:
+        ``teacher_log_prob - old_log_prob``.
+    """
+    if teacher_log_prob is None or old_log_prob is None:
+        return torch.zeros(response_mask.shape, dtype=torch.float32, device=response_mask.device)
+
+    if teacher_log_prob.shape != old_log_prob.shape:
+        raise ValueError(
+            f"teacher_log_prob shape {tuple(teacher_log_prob.shape)} does not match "
+            f"old_log_prob shape {tuple(old_log_prob.shape)}"
+        )
+    if teacher_log_prob.shape != response_mask.shape:
+        raise ValueError(
+            f"teacher_log_prob shape {tuple(teacher_log_prob.shape)} does not match "
+            f"response_mask shape {tuple(response_mask.shape)}"
+        )
+
+    critical_mask = _broadcast_mask_to_response(
+        mask=critical_step_mask,
+        response_mask=response_mask,
+        name="critical_step_mask",
+    )
+
+    teacher_advantages = (teacher_log_prob - old_log_prob).detach()
+    teacher_advantages = teacher_advantages * response_mask.to(dtype=teacher_advantages.dtype)
+    teacher_advantages = teacher_advantages * critical_mask.to(dtype=teacher_advantages.dtype)
+
+    if normalize:
+        valid_mask = (response_mask > 0) & (critical_mask > 0)
+        if valid_mask.any():
+            valid_values = teacher_advantages[valid_mask]
+            mean = valid_values.mean()
+            std = valid_values.std(unbiased=False)
+            if std > epsilon:
+                teacher_advantages = torch.where(
+                    valid_mask,
+                    (teacher_advantages - mean) / (std + epsilon),
+                    teacher_advantages,
+                )
+            else:
+                teacher_advantages = torch.where(
+                    valid_mask,
+                    teacher_advantages - mean,
+                    teacher_advantages,
+                )
+
+    if clip_range is not None:
+        teacher_advantages = torch.clamp(teacher_advantages, -clip_range, clip_range)
+
+    return teacher_advantages
+
 # ---------------------------------------------------------- #
 # ---------------- Core Functions of GiGPO ----------------- #
 # ---------------------------------------------------------- #
@@ -150,12 +264,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     """
     Compute the advantages for GiGPO (https://arxiv.org/abs/2505.10978).
     """
-    if mode == "mean_std_norm":
-        remove_std = False
-    elif mode == "mean_norm":
-        remove_std = True
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
+    remove_std = _mode_to_remove_std(mode)
     
     # Compute episode relative advantages (Eq. 3 in the paper).
     episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std)
@@ -168,6 +277,75 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
 
     # Compute joint advantages (Eq. 8 in the paper).
     scores = episode_advantages + step_advantage_w * step_advantages
+    return scores, scores
+
+
+def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
+                                   step_rewards: torch.Tensor,
+                                   response_mask: torch.Tensor,
+                                   anchor_obs: np.array,
+                                   index: np.array,
+                                   traj_index: np.array,
+                                   teacher_log_prob: Optional[torch.Tensor] = None,
+                                   old_log_prob: Optional[torch.Tensor] = None,
+                                   critical_step_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
+                                   epsilon: float = 1e-6,
+                                   step_advantage_w: float = 1.0,
+                                   teacher_advantage_w: float = 1.0,
+                                   mode: str = "mean_norm",
+                                   enable_similarity: bool = False,
+                                   similarity_thresh: float = 0.95,
+                                   normalize_teacher_adv: bool = False,
+                                   clip_teacher_adv: Optional[float] = None,
+                                   ):
+    """
+    Compute the advantages for COPD.
+
+    COPD extends GiGPO by adding a token-level teacher advantage term:
+        episode_adv + w_step * step_adv + w_teacher * teacher_adv
+    where ``teacher_adv`` is derived from
+        ``teacher_log_prob - old_log_prob``.
+    """
+    remove_std = _mode_to_remove_std(mode)
+
+    episode_advantages = episode_norm_reward(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        traj_index=traj_index,
+        epsilon=epsilon,
+        remove_std=remove_std,
+    )
+
+    step_group_uids = build_step_group(
+        anchor_obs=anchor_obs,
+        index=index,
+        enable_similarity=enable_similarity,
+        similarity_thresh=similarity_thresh,
+    )
+    step_advantages = step_norm_reward(
+        step_rewards=step_rewards,
+        response_mask=response_mask,
+        index=step_group_uids,
+        epsilon=epsilon,
+        remove_std=remove_std,
+    )
+
+    teacher_advantages = compute_teacher_token_advantage(
+        response_mask=response_mask,
+        teacher_log_prob=teacher_log_prob,
+        old_log_prob=old_log_prob,
+        critical_step_mask=critical_step_mask,
+        normalize=normalize_teacher_adv,
+        clip_range=clip_teacher_adv,
+        epsilon=epsilon,
+    )
+
+    scores = (
+        episode_advantages
+        + step_advantage_w * step_advantages
+        + teacher_advantage_w * teacher_advantages
+    )
     return scores, scores
 
 
@@ -382,4 +560,3 @@ def step_norm_reward(step_rewards: torch.Tensor,
         step_advantages = scores.unsqueeze(-1).tile([1, response_length]) * response_mask
     
     return step_advantages
-

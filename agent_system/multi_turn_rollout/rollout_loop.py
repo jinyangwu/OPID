@@ -23,7 +23,7 @@ from transformers import PreTrainedTokenizer
 import uuid
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
-from typing import List, Dict
+from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 class TrajectoryCollector:
@@ -39,6 +39,78 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+
+    def build_text_prompt_sample(
+        self,
+        obs_content: str,
+        data_source: Optional[str] = None,
+    ) -> Dict:
+        """
+        Build a text-only prompt sample using the same chat-template path as rollout.
+        This is used by COPD teacher scoring to reconstruct prompt-enhanced inputs.
+        """
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        chat = np.array([{
+            "content": obs_content,
+            "role": "user",
+        }])
+        prompt_with_chat_template = self.tokenizer.apply_chat_template(
+            chat,
+            add_generation_prompt=True,
+            tokenize=False,
+            **apply_chat_template_kwargs
+        )
+        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
+            prompt=prompt_with_chat_template,
+            tokenizer=self.tokenizer,
+            max_length=self.config.data.max_prompt_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=True,
+            truncation=self.config.data.truncation,
+        )
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        raw_prompt_ids = self.tokenizer.encode(prompt_with_chat_template, add_special_tokens=False)
+        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
+            if self.config.data.truncation == "left":
+                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
+            elif self.config.data.truncation == "right":
+                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
+            elif self.config.data.truncation == "middle":
+                left_half = self.config.data.max_prompt_length // 2
+                right_half = self.config.data.max_prompt_length - left_half
+                raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
+            elif self.config.data.truncation == "error":
+                raise RuntimeError(
+                    f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}."
+                )
+
+        return {
+            "input_ids": input_ids[0],
+            "attention_mask": attention_mask[0],
+            "position_ids": position_ids[0],
+            "raw_prompt_ids": raw_prompt_ids,
+            "obs_text": obs_content,
+            "data_source": data_source,
+        }
+
+    def build_text_prompt_batch(
+        self,
+        obs_contents: List[str],
+        data_sources: Optional[List[Optional[str]]] = None,
+        meta_info: Optional[Dict] = None,
+    ) -> DataProto:
+        """
+        Build a batch of text-only prompts. Used for COPD teacher scoring.
+        """
+        processed_samples = []
+        for sample_idx, obs_content in enumerate(obs_contents):
+            data_source = None if data_sources is None else data_sources[sample_idx]
+            processed_samples.append(
+                self.build_text_prompt_sample(obs_content=obs_content, data_source=data_source)
+            )
+        batch = collate_fn(processed_samples)
+        return DataProto.from_single_dict(data=batch, meta_info=meta_info)
 
     def preprocess_single_sample(
         self,
@@ -178,6 +250,7 @@ class TrajectoryCollector:
             'position_ids': position_ids[0],
             'raw_prompt_ids': raw_prompt_ids,
             'anchor_obs': _obs_anchor,
+            'obs_text': obs_content,
             'index': item,
             'data_source': data_source
         })

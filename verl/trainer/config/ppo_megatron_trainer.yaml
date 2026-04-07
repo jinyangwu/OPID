@@ -286,6 +286,30 @@ algorithm:
   pf_ppo:
     reweight_method: pow  # ["pow", "max_min", "max_random"]
     weight_pow: 2.0
+  gigpo:
+    step_advantage_w: 1.0
+    mode: "mean_norm"
+    enable_similarity: False
+    similarity_thresh: 0.95
+  copd:
+    step_advantage_w: 1.0
+    teacher_advantage_w: 1.0
+    mode: "mean_norm"
+    enable_similarity: False
+    similarity_thresh: 0.95
+    selector: "stats"
+    stats_min_group_size: 2
+    stats_var_quantile: 0.75
+    stats_topk_per_traj: 1
+    stats_below_group_mean_only: True
+    analysis_backend: "heuristic"
+    analysis_num_workers: 8
+    analysis_max_history_steps: 6
+    analysis_max_completion_tokens: 1024
+    save_analysis: False
+    analysis_dump_dir: null # null -> ${trainer.default_local_dir}/copd_analysis
+    normalize_teacher_adv: False
+    clip_teacher_adv: null
 
 trainer:
   balance_batch: True

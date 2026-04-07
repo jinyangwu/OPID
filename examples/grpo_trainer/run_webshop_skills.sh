@@ -10,10 +10,11 @@ export VLLM_LOGGING_LEVEL=DEBUG
 # export WANDB_API_KEY=
 export WANDB_NAME="webshop_grpo_qwen2.5_7b_sft_skills_dynamic"
 
+MODEL_PATH=/raid3/data/GTPO/Webshop-7B-SFT
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
 train_data_size=16  # Moderate size
-val_data_size=64    # Moderate size
+val_data_size=128    # Moderate size
 group_size=8        # Moderate parallelism
 
 # We only use data preparation to indicate the modality and the data size.
@@ -42,12 +43,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -66,19 +67,22 @@ python3 -m verl.trainer.main_ppo \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     +env.use_skills_only_memory=True \
-    +env.skills_only_memory.skills_json_path=$HOME/verl-agent/memory_data/webshop/claude_style_skills.json \
-    +env.skills_only_memory.top_k=6 \
+    +env.skills_only_memory.skills_json_path=memory_data/webshop/claude_style_skills.json \
+    +env.skills_only_memory.retrieval_mode=embedding \
+    +env.skills_only_memory.embedding_model_path=/raid3/data/GTPO/Qwen3-Embedding-0.6B \
+    +env.skills_only_memory.top_k=15 \
+    +env.skills_only_memory.task_specific_top_k=5 \
     +env.skills_only_memory.enable_dynamic_update=True \
     +env.skills_only_memory.update_threshold=0.4 \
     +env.skills_only_memory.max_new_skills=3 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_webshop' \
+    trainer.project_name='agentic_webshop' \
     trainer.experiment_name='grpo_qwen2.5_7b_skills_dynamic' \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
+    trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=False \
-    trainer.default_local_dir=/playpen-raid/pxia/ckpt/verl_agent_webshop/grpo_qwen2.5_7b_skills_dynamic $@
+    trainer.val_before_train=True \
+    trainer.default_local_dir=/raid3/data/GTPO/verl_agent_webshop/grpo_qwen2.5_7b_skills_dynamic $@

@@ -690,7 +690,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     available_actions=reformatted_available_actions
                 )
-            if len(obs) > 13000:
+            if len(obs) > 20000:
                 print(f"Warning len(obs)={len(obs)} is too long")
                 obs = WEBSHOP_TEMPLATE_NO_HIS.format(
                     task_description=self.tasks[i],

@@ -19,8 +19,10 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -61,10 +63,12 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
+from gigpo import copd as core_copd
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
+module_logger = logging.getLogger(__name__)
 
 
 class Role(Enum):
@@ -94,6 +98,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    COPD = "copd"
 
 
 @dataclass
@@ -241,7 +246,26 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
+def compute_advantage(
+    data: DataProto,
+    adv_estimator,
+    gamma=1.0,
+    lam=1.0,
+    num_repeat=1,
+    multi_turn=False,
+    norm_adv_by_std_in_grpo=True,
+    step_advantage_w=1.0,
+    gigpo_mode="mean_std_norm",
+    gigpo_enable_similarity=False,
+    gigpo_similarity_thresh=0.95,
+    teacher_advantage_w=1.0,
+    copd_mode="mean_norm",
+    copd_enable_similarity=False,
+    copd_similarity_thresh=0.95,
+    copd_normalize_teacher_adv=False,
+    copd_clip_teacher_adv=None,
+    **kwargs,
+):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -357,6 +381,36 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.COPD:
+        teacher_log_prob = data.batch['teacher_log_prob'] if 'teacher_log_prob' in data.batch.keys() else None
+        old_log_prob = data.batch['old_log_probs'] if 'old_log_probs' in data.batch.keys() else None
+        if 'critical_step_mask' in data.batch.keys():
+            critical_step_mask = data.batch['critical_step_mask']
+        elif 'critical_step_mask' in data.non_tensor_batch.keys():
+            critical_step_mask = data.non_tensor_batch['critical_step_mask']
+        else:
+            critical_step_mask = None
+
+        advantages, returns = core_gigpo.compute_copd_outcome_advantage(
+            token_level_rewards=data.batch['token_level_rewards'],
+            step_rewards=data.batch['step_rewards'],
+            response_mask=data.batch['response_mask'],
+            anchor_obs=data.non_tensor_batch['anchor_obs'],
+            index=data.non_tensor_batch['uid'],
+            traj_index=data.non_tensor_batch['traj_uid'],
+            teacher_log_prob=teacher_log_prob,
+            old_log_prob=old_log_prob,
+            critical_step_mask=critical_step_mask,
+            step_advantage_w=step_advantage_w,
+            teacher_advantage_w=teacher_advantage_w,
+            mode=copd_mode,
+            enable_similarity=copd_enable_similarity,
+            similarity_thresh=copd_similarity_thresh,
+            normalize_teacher_adv=copd_normalize_teacher_adv,
+            clip_teacher_adv=copd_clip_teacher_adv,
+        )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -418,6 +472,7 @@ class RayPPOTrainer:
         self.val_reward_fn = val_reward_fn
         self.envs = envs
         self.val_envs = val_envs
+        self._copd_analyzer = None
         self.traj_collector = traj_collector
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -451,7 +506,8 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
+            AdvantageEstimator.GiGPO,
+            AdvantageEstimator.COPD,
         ]:
             self.use_critic = False
         else:
@@ -661,6 +717,69 @@ class RayPPOTrainer:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _get_copd_analysis_dump_dir(self) -> Optional[str]:
+        save_analysis = OmegaConf.select(self.config, "algorithm.copd.save_analysis")
+        if not save_analysis:
+            return None
+
+        dump_dir = OmegaConf.select(self.config, "algorithm.copd.analysis_dump_dir")
+        if dump_dir:
+            return dump_dir
+
+        return os.path.join(self.config.trainer.default_local_dir, "copd_analysis")
+
+    def _dump_copd_analysis(
+        self,
+        analysis_tasks: Dict[object, Dict[str, object]],
+        episode_analysis: Dict[object, Dict[str, object]],
+        selector: str,
+    ) -> None:
+        dump_dir = self._get_copd_analysis_dump_dir()
+        if dump_dir is None or not analysis_tasks:
+            return
+
+        os.makedirs(dump_dir, exist_ok=True)
+        filename = os.path.join(dump_dir, f"step_{self.global_steps:08d}.jsonl")
+
+        with open(filename, "w", encoding="utf-8") as f:
+            for traj_uid, task in analysis_tasks.items():
+                analysis = episode_analysis.get(traj_uid, {})
+                entry = {
+                    "global_step": int(self.global_steps),
+                    "traj_uid": str(traj_uid),
+                    "selector": selector,
+                    "analysis_backend_requested": analysis.get(
+                        "analysis_backend_requested",
+                        self.config.algorithm.copd.analysis_backend,
+                    ),
+                    "analysis_backend_used": analysis.get(
+                        "analysis_backend_used",
+                        self.config.algorithm.copd.analysis_backend,
+                    ),
+                    "analysis_error": analysis.get("analysis_error"),
+                    "select_steps": bool(task.get("select_steps", False)),
+                    "candidate_step_indices": task.get("candidate_step_indices"),
+                    "num_steps": len(task.get("steps", [])),
+                    "step_indices": [
+                        int(step.get("step_index", -1))
+                        for step in task.get("steps", [])
+                    ],
+                    "episode_summary": str(analysis.get("episode_summary", "")),
+                    "selected_steps": [
+                        int(step_idx)
+                        for step_idx in analysis.get("selected_steps", [])
+                    ],
+                    "step_hints": {
+                        str(step_idx): str(hint)
+                        for step_idx, hint in analysis.get("step_hints", {}).items()
+                    },
+                    "llm_prompt": analysis.get("llm_prompt"),
+                    "llm_raw_output": analysis.get("llm_raw_output"),
+                }
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        module_logger.info("Dumped COPD analysis results to %s", filename)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1110,6 +1229,345 @@ class RayPPOTrainer:
                 worker_group=self.actor_rollout_wg,
             )
 
+    def _lazy_init_copd_analyzer(self):
+        if self._copd_analyzer is None:
+            module_logger.info(
+                "Initializing COPD analyzer with backend=%s, max_history_steps=%s, max_completion_tokens=%s, max_selected_steps_per_traj=%s",
+                self.config.algorithm.copd.analysis_backend,
+                self.config.algorithm.copd.analysis_max_history_steps,
+                self.config.algorithm.copd.analysis_max_completion_tokens,
+                self.config.algorithm.copd.stats_topk_per_traj,
+            )
+            self._copd_analyzer = core_copd.COPDEpisodeAnalyzer(
+                backend=self.config.algorithm.copd.analysis_backend,
+                max_history_steps=self.config.algorithm.copd.analysis_max_history_steps,
+                max_completion_tokens=self.config.algorithm.copd.analysis_max_completion_tokens,
+                max_selected_steps_per_traj=self.config.algorithm.copd.stats_topk_per_traj,
+            )
+        return self._copd_analyzer
+
+    def _analyze_copd_episodes(self, analyzer, analysis_tasks: Dict[object, Dict[str, object]]):
+        """
+        Analyze multiple trajectories for COPD. Azure-backed analysis is run with
+        a thread pool to hide per-request latency.
+        """
+        if not analysis_tasks:
+            return {}, 0
+
+        backend = self.config.algorithm.copd.analysis_backend
+        configured_workers = int(self.config.algorithm.copd.analysis_num_workers)
+        max_workers = max(1, min(configured_workers, len(analysis_tasks)))
+
+        module_logger.info(
+            "Running COPD episode analysis for %s trajectories with backend=%s and num_workers=%s",
+            len(analysis_tasks),
+            backend,
+            max_workers,
+        )
+
+        if backend not in ("azure", "google") or max_workers <= 1:
+            results = {}
+            for traj_uid, task in analysis_tasks.items():
+                results[traj_uid] = analyzer.analyze_episode(
+                    steps=task["steps"],
+                    candidate_step_indices=task["candidate_step_indices"],
+                    select_steps=task["select_steps"],
+                )
+            return results, 1
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="copd-analysis") as executor:
+            future_to_traj = {
+                executor.submit(
+                    analyzer.analyze_episode,
+                    steps=task["steps"],
+                    candidate_step_indices=task["candidate_step_indices"],
+                    select_steps=task["select_steps"],
+                ): traj_uid
+                for traj_uid, task in analysis_tasks.items()
+            }
+            for future in as_completed(future_to_traj):
+                traj_uid = future_to_traj[future]
+                try:
+                    results[traj_uid] = future.result()
+                except Exception as exc:
+                    module_logger.warning("COPD analysis failed for trajectory %s: %s", traj_uid, exc)
+                    results[traj_uid] = {
+                        "episode_summary": "",
+                        "selected_steps": [],
+                        "step_hints": {},
+                    }
+        return results, max_workers
+
+    def _prepare_copd_teacher_signals(self, batch: DataProto, metrics: Dict[str, float]) -> DataProto:
+        """
+        Prepare COPD critical-step masks and teacher log-probs before advantage computation.
+
+        The current implementation supports text-only prompt enhancement. If the
+        rollout batch does not expose text observations, COPD falls back to a
+        zero teacher signal instead of affecting training stability.
+        """
+        batch_size = len(batch)
+        response_mask = compute_response_mask(batch)
+        zero_teacher_log_prob = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        zero_critical_mask = torch.zeros(batch_size, dtype=torch.bool, device=batch.batch["responses"].device)
+        traj_uids = batch.non_tensor_batch.get("traj_uid", [])
+        num_trajectories = len(set(traj_uids)) if len(traj_uids) > 0 else 0
+
+        module_logger.info(
+            "Preparing COPD teacher signals for batch_size=%s, num_trajectories=%s, selector=%s, analysis_backend=%s",
+            batch_size,
+            num_trajectories,
+            self.config.algorithm.copd.selector,
+            self.config.algorithm.copd.analysis_backend,
+        )
+
+        if "obs_text" not in batch.non_tensor_batch:
+            module_logger.warning("COPD teacher signal skipped because obs_text is missing from the rollout batch.")
+            batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            batch.batch["critical_step_mask"] = zero_critical_mask
+            metrics["copd/critical_step_ratio"] = 0.0
+            metrics["copd/teacher_batch_size"] = 0.0
+            metrics["copd/teacher_available"] = 0.0
+            return batch
+
+        step_indices = core_copd.build_traj_step_indices(batch.non_tensor_batch["traj_uid"])
+        batch.non_tensor_batch["step_idx"] = step_indices
+
+        selector = self.config.algorithm.copd.selector
+        analyzer = self._lazy_init_copd_analyzer()
+        critical_mask_np = np.zeros(batch_size, dtype=bool)
+        selector_stats = {
+            "num_groups": 0.0,
+            "eligible_groups": 0.0,
+            "selected_steps": 0.0,
+            "variance_cutoff": 0.0,
+        }
+
+        episodes = core_copd.build_episode_records(
+            tokenizer=self.tokenizer,
+            obs_texts=batch.non_tensor_batch["obs_text"],
+            responses=batch.batch["responses"],
+            response_mask=response_mask,
+            traj_index=batch.non_tensor_batch["traj_uid"],
+            step_indices=step_indices,
+            step_rewards=batch.batch["step_rewards"] if "step_rewards" in batch.batch.keys() else None,
+        )
+        if episodes:
+            episode_lengths = [len(steps) for steps in episodes.values()]
+            module_logger.info(
+                "Built COPD episode records for %s trajectories (min_steps=%s, mean_steps=%.2f, max_steps=%s)",
+                len(episodes),
+                min(episode_lengths),
+                float(np.mean(episode_lengths)),
+                max(episode_lengths),
+            )
+        else:
+            module_logger.info("No COPD episode records were built for the current batch.")
+
+        episode_analysis: Dict[object, Dict[str, object]] = {}
+        analysis_tasks: Dict[object, Dict[str, object]] = {}
+
+        if selector == "stats":
+            critical_mask_np, selector_stats = core_copd.select_critical_steps_by_stats(
+                step_rewards=batch.batch["step_rewards"],
+                anchor_obs=batch.non_tensor_batch["anchor_obs"],
+                index=batch.non_tensor_batch["uid"],
+                traj_index=batch.non_tensor_batch["traj_uid"],
+                enable_similarity=self.config.algorithm.copd.enable_similarity,
+                similarity_thresh=self.config.algorithm.copd.similarity_thresh,
+                min_group_size=self.config.algorithm.copd.stats_min_group_size,
+                var_quantile=self.config.algorithm.copd.stats_var_quantile,
+                topk_per_traj=self.config.algorithm.copd.stats_topk_per_traj,
+                below_group_mean_only=self.config.algorithm.copd.stats_below_group_mean_only,
+            )
+            module_logger.info(
+                "COPD stats selector produced %s candidate critical steps (groups=%s, eligible_groups=%s, variance_cutoff=%.6f)",
+                int(critical_mask_np.sum()),
+                int(selector_stats["num_groups"]),
+                int(selector_stats["eligible_groups"]),
+                float(selector_stats["variance_cutoff"]),
+            )
+            for traj_uid, steps in episodes.items():
+                candidate_step_indices = [
+                    int(step_indices[sample_idx])
+                    for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"])
+                    if sample_traj_uid == traj_uid and critical_mask_np[sample_idx]
+                ]
+                if not candidate_step_indices:
+                    episode_analysis[traj_uid] = {
+                        "episode_summary": "",
+                        "selected_steps": [],
+                        "step_hints": {},
+                    }
+                    continue
+                analysis_tasks[traj_uid] = {
+                    "steps": steps,
+                    "candidate_step_indices": candidate_step_indices,
+                    "select_steps": False,
+                }
+            analyzed, analysis_workers = self._analyze_copd_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
+            episode_analysis.update(analyzed)
+        elif selector == "llm":
+            module_logger.info(
+                "COPD LLM selector will analyze %s trajectories for critical-step selection.",
+                len(episodes),
+            )
+            for traj_uid, steps in episodes.items():
+                analysis_tasks[traj_uid] = {
+                    "steps": steps,
+                    "candidate_step_indices": None,
+                    "select_steps": True,
+                }
+            analyzed, analysis_workers = self._analyze_copd_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
+            episode_analysis.update(analyzed)
+            for traj_uid, analysis in episode_analysis.items():
+                selected_steps = set(int(step_idx) for step_idx in analysis.get("selected_steps", []))
+                for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
+                    if sample_traj_uid == traj_uid and int(step_indices[sample_idx]) in selected_steps:
+                        critical_mask_np[sample_idx] = True
+            selector_stats["selected_steps"] = float(critical_mask_np.sum())
+            module_logger.info(
+                "COPD LLM selector chose %s critical steps after analysis.",
+                int(critical_mask_np.sum()),
+            )
+        else:
+            raise ValueError(f"Unsupported COPD selector: {selector}")
+        metrics["copd/analysis_num_requests"] = float(len(analysis_tasks))
+        metrics["copd/analysis_num_workers"] = float(analysis_workers)
+        module_logger.info(
+            "COPD episode analysis finished: requests=%s, workers=%s, analyzed_trajectories=%s",
+            len(analysis_tasks),
+            analysis_workers,
+            len(episode_analysis),
+        )
+        self._dump_copd_analysis(
+            analysis_tasks=analysis_tasks,
+            episode_analysis=episode_analysis,
+            selector=selector,
+        )
+
+        critical_indices = np.where(critical_mask_np)[0]
+        critical_mask = torch.as_tensor(
+            critical_mask_np,
+            device=batch.batch["responses"].device,
+            dtype=torch.bool,
+        )
+        batch.batch["critical_step_mask"] = critical_mask
+
+        metrics["copd/critical_step_ratio"] = float(critical_mask_np.mean()) if batch_size > 0 else 0.0
+        metrics["copd/teacher_batch_size"] = float(len(critical_indices))
+        metrics["copd/teacher_available"] = 1.0
+        metrics["copd/selector_num_groups"] = selector_stats["num_groups"]
+        metrics["copd/selector_eligible_groups"] = selector_stats["eligible_groups"]
+        metrics["copd/selector_variance_cutoff"] = selector_stats["variance_cutoff"]
+        module_logger.info(
+            "COPD finalized %s critical steps for teacher shaping (critical_step_ratio=%.4f).",
+            len(critical_indices),
+            metrics["copd/critical_step_ratio"],
+        )
+
+        if len(critical_indices) == 0:
+            module_logger.info("COPD did not select any critical steps for the current batch.")
+            batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            return batch
+
+        if "multi_modal_inputs" in batch.non_tensor_batch:
+            module_logger.warning("COPD teacher signal skipped for the current batch because multi_modal_inputs are present.")
+            batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            metrics["copd/teacher_skipped_multimodal"] = 1.0
+            return batch
+
+        enhanced_obs_texts = []
+        data_sources = []
+        critical_response_mask = response_mask[critical_indices]
+        critical_responses = batch.batch["responses"][critical_indices]
+        critical_preview = []
+        for sample_idx in critical_indices:
+            traj_uid = batch.non_tensor_batch["traj_uid"][sample_idx]
+            analysis = episode_analysis.get(traj_uid, {})
+            step_hint = analysis.get("step_hints", {}).get(int(step_indices[sample_idx]), "")
+            enhanced_obs_texts.append(
+                core_copd.build_enhanced_observation_text(
+                    observation=str(batch.non_tensor_batch["obs_text"][sample_idx]),
+                    episode_summary=str(analysis.get("episode_summary", "")),
+                    hindsight_hint=str(step_hint),
+                )
+            )
+            data_sources.append(
+                batch.non_tensor_batch["data_source"][sample_idx]
+                if "data_source" in batch.non_tensor_batch
+                else None
+            )
+            if len(critical_preview) < 3:
+                critical_preview.append(
+                    {
+                        "traj_uid": str(traj_uid),
+                        "step_idx": int(step_indices[sample_idx]),
+                        "hint_preview": str(step_hint).replace("\n", " ")[:160],
+                        "obs_preview": str(batch.non_tensor_batch["obs_text"][sample_idx]).replace("\n", " ")[:160],
+                    }
+                )
+
+        module_logger.info(
+            "COPD built %s enhanced observations for teacher scoring across %s trajectories.",
+            len(enhanced_obs_texts),
+            len({batch.non_tensor_batch['traj_uid'][sample_idx] for sample_idx in critical_indices}),
+        )
+        if critical_preview and module_logger.isEnabledFor(logging.DEBUG):
+            module_logger.debug("COPD critical-step preview: %s", critical_preview)
+
+        teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
+            obs_contents=enhanced_obs_texts,
+            data_sources=data_sources,
+            meta_info=deepcopy(batch.meta_info),
+        )
+        teacher_prompt_lengths = teacher_prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
+        module_logger.info(
+            "COPD teacher prompt lengths: min=%s, mean=%.2f, max=%s",
+            int(teacher_prompt_lengths.min()),
+            float(teacher_prompt_lengths.mean()),
+            int(teacher_prompt_lengths.max()),
+        )
+
+        teacher_input_ids = torch.cat([teacher_prompt_batch.batch["input_ids"], critical_responses], dim=-1)
+        teacher_attention_mask = torch.cat(
+            [teacher_prompt_batch.batch["attention_mask"], critical_response_mask.to(dtype=teacher_prompt_batch.batch["attention_mask"].dtype)],
+            dim=-1,
+        )
+        teacher_position_ids = torch.clip(torch.cumsum(teacher_attention_mask, dim=-1) - 1, min=0)
+
+        teacher_batch = DataProto.from_dict(
+            tensors={
+                "responses": critical_responses,
+                "input_ids": teacher_input_ids,
+                "attention_mask": teacher_attention_mask,
+                "position_ids": teacher_position_ids,
+            },
+            meta_info=deepcopy(batch.meta_info),
+        )
+        teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(teacher_batch, self.actor_rollout_wg.world_size)
+        teacher_log_prob_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
+        teacher_log_prob = unpad_dataproto(teacher_log_prob_padded, pad_size=teacher_pad_size)
+
+        full_teacher_log_prob = zero_teacher_log_prob
+        full_teacher_log_prob[critical_indices] = teacher_log_prob.batch["old_log_probs"]
+        batch.batch["teacher_log_prob"] = full_teacher_log_prob
+        teacher_lp = teacher_log_prob.batch["old_log_probs"]
+
+        module_logger.info(
+            "COPD computed teacher log-probs for %s critical steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
+            len(critical_indices),
+            float(teacher_lp.mean().detach().cpu().item()),
+            float(teacher_lp.min().detach().cpu().item()),
+            float(teacher_lp.max().detach().cpu().item()),
+        )
+        if len(critical_indices) > 0:
+            metrics["copd/teacher_log_prob_mean"] = float(
+                teacher_lp.mean().detach().cpu().item()
+            )
+        return batch
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
@@ -1310,12 +1768,14 @@ class RayPPOTrainer:
                     del batch
                     batch = gen_batch_output
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                    if self.config.algorithm.adv_estimator in [AdvantageEstimator.GiGPO, AdvantageEstimator.COPD]:
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
+                        batch = self._prepare_copd_teacher_signals(batch=batch, metrics=metrics)
                     
                     batch = adjust_batch(self.config, batch)
 
@@ -1431,10 +1891,20 @@ class RayPPOTrainer:
                             use_pf_ppo=self.config.algorithm.use_pf_ppo,
                             pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
                             pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
-                            step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
+                            step_advantage_w=(
+                                self.config.algorithm.copd.step_advantage_w
+                                if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD
+                                else self.config.algorithm.gigpo.step_advantage_w
+                            ),
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            teacher_advantage_w=self.config.algorithm.copd.teacher_advantage_w,
+                            copd_mode=self.config.algorithm.copd.mode,
+                            copd_enable_similarity=self.config.algorithm.copd.enable_similarity,
+                            copd_similarity_thresh=self.config.algorithm.copd.similarity_thresh,
+                            copd_normalize_teacher_adv=self.config.algorithm.copd.normalize_teacher_adv,
+                            copd_clip_teacher_adv=self.config.algorithm.copd.clip_teacher_adv,
                         )
 
                     # update critic
