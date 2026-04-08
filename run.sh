@@ -10,3 +10,6 @@ sleep 3
 set -ex
 
 bash examples/grpo_trainer/run_webshop_skills.sh
+
+
+python scripts/test_openai_api.py --env-file .env --show-reasoning --dump-response --json-output

@@ -1264,16 +1264,9 @@ class RayPPOTrainer:
             backend,
             max_workers,
         )
+        print(f"COPD analysis backend: {backend}, configured_workers: {configured_workers}, max_workers: {max_workers}")
 
-        if backend not in ("azure", "google") or max_workers <= 1:
-            results = {}
-            for traj_uid, task in analysis_tasks.items():
-                results[traj_uid] = analyzer.analyze_episode(
-                    steps=task["steps"],
-                    candidate_step_indices=task["candidate_step_indices"],
-                    select_steps=task["select_steps"],
-                )
-            return results, 1
+        assert backend in ["openai"], f"Unsupported COPD analysis backend: {backend}"
 
         results = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="copd-analysis") as executor:
@@ -1347,6 +1340,7 @@ class RayPPOTrainer:
         episodes = core_copd.build_episode_records(
             tokenizer=self.tokenizer,
             obs_texts=batch.non_tensor_batch["obs_text"],
+            obs_raws=batch.non_tensor_batch.get("anchor_obs"),
             responses=batch.batch["responses"],
             response_mask=response_mask,
             traj_index=batch.non_tensor_batch["traj_uid"],

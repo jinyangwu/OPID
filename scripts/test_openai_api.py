@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="Reply with exactly: ok",
+        default="中国最长的河流是什么？",
         help="User prompt for the test request.",
     )
     parser.add_argument(
@@ -126,6 +126,11 @@ def parse_args() -> argparse.Namespace:
         help="Print the raw response payload after the request returns.",
     )
     parser.add_argument(
+        "--show-reasoning",
+        action="store_true",
+        help="Print message.reasoning_content separately when available.",
+    )
+    parser.add_argument(
         "--json-output",
         action="store_true",
         help="Ask the model to return only valid JSON and validate the response.",
@@ -163,6 +168,7 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         "system_prompt": args.system_prompt,
         "show_messages": args.show_messages,
         "dump_response": args.dump_response,
+        "show_reasoning": args.show_reasoning,
         "json_output": args.json_output,
         "json_schema": args.json_schema,
     }
@@ -282,6 +288,10 @@ def main() -> int:
     print("\nRequest succeeded.")
     print(f"response_id: {getattr(response, 'id', '<unknown>')}")
     print(f"model: {getattr(response, 'model', '<unknown>')}")
+    message = response.choices[0].message if getattr(response, "choices", None) else None
+    if config["show_reasoning"] and message is not None:
+        print(f"reasoning: {getattr(message, 'reasoning_content', None)!r}")
+        print(f"message_content: {getattr(message, 'content', None)!r}")
     extracted_text = extract_message_text(response)
     print(f"content: {extracted_text!r}")
     if config["json_output"] and extracted_text:

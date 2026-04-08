@@ -84,12 +84,12 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.analysis_backend=$COPD_ANALYSIS_BACKEND \
     algorithm.copd.analysis_num_workers=$COPD_ANALYSIS_NUM_WORKERS \
     algorithm.copd.analysis_max_history_steps=15 \
-    algorithm.copd.analysis_max_completion_tokens=1024 \
+    algorithm.copd.analysis_max_completion_tokens=4096 \
     algorithm.copd.normalize_teacher_adv=False \
     env.history_length=$history_length \
     env.env_name=Webshop \
     env.seed=0 \
-    env.max_steps=5 \
+    env.max_steps=15 \
     env.rollout.n=$GROUP_SIZE \
     env.resources_per_worker.num_cpus=$NUM_CPUS_PER_ENV_WORKER \
     trainer.critic_warmup=0 \

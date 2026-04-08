@@ -6,14 +6,14 @@ ulimit -u 65536
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/qwen2.5-1.5b-instruct}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-1.5B-Instruct}
 TRAIN_DATA_SIZE=16
 VAL_DATA_SIZE=128
 GROUP_SIZE=8
 NUM_CPUS_PER_ENV_WORKER=0.1
 
 COPD_MODE=mean_norm
-COPD_SELECTOR=llm
+COPD_SELECTOR=stats
 COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
@@ -24,7 +24,7 @@ COPD_STATS_TOPK_PER_TRAJ=3
 COPD_SIMILARITY_THRESH=0.95
 
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_5-2
+EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_5-3
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 history_length=2
@@ -84,7 +84,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.analysis_backend=$COPD_ANALYSIS_BACKEND \
     algorithm.copd.analysis_num_workers=$COPD_ANALYSIS_NUM_WORKERS \
     algorithm.copd.analysis_max_history_steps=15 \
-    algorithm.copd.analysis_max_completion_tokens=1024 \
+    algorithm.copd.analysis_max_completion_tokens=4096 \
     algorithm.copd.normalize_teacher_adv=False \
     env.history_length=$history_length \
     env.env_name=Webshop \

@@ -141,8 +141,14 @@ def build_episode_records(
     traj_index: Sequence,
     step_indices: Sequence,
     step_rewards: Optional[torch.Tensor] = None,
+    obs_raws: Optional[Sequence] = None,
 ) -> Dict[object, List[Dict[str, object]]]:
-    """Decode trajectories into step records for analysis."""
+    """Decode trajectories into step records for analysis.
+
+    `observation` prefers raw text feedback from the environment when
+    available (for example `anchor_obs` in rollout batches). The prompt-form
+    observation is preserved in `observation_prompt` for debugging.
+    """
     if step_rewards is not None:
         reward_np = step_rewards.detach().cpu().numpy().astype(np.float32)
     else:
@@ -157,9 +163,16 @@ def build_episode_records(
             responses_cpu[sample_idx][:valid_len],
             skip_special_tokens=True,
         )
+        prompt_observation = str(obs_texts[sample_idx])
+        raw_observation = prompt_observation
+        if obs_raws is not None:
+            candidate_raw_observation = obs_raws[sample_idx]
+            if isinstance(candidate_raw_observation, (str, np.str_)):
+                raw_observation = str(candidate_raw_observation)
         step_record = {
             "step_index": int(step_indices[sample_idx]),
-            "observation": str(obs_texts[sample_idx]),
+            "observation": raw_observation,
+            "observation_prompt": prompt_observation,
             "response": response_text,
         }
         if reward_np is not None:
@@ -314,23 +327,36 @@ class COPDEpisodeAnalyzer:
         select_steps: bool = False,
     ) -> Dict[str, object]:
         if self.backend == "openai":
-            try:
-                return self._analyze_episode_with_openai(
-                    steps=steps,
-                    candidate_step_indices=candidate_step_indices,
-                    select_steps=select_steps,
-                )
-            except Exception as exc:  # pragma: no cover - runtime fallback
-                logger.warning("COPD OpenAI analysis failed, falling back to heuristic: %s", exc)
-                fallback = self._analyze_episode_with_heuristic(
-                    steps=steps,
-                    candidate_step_indices=candidate_step_indices,
-                    select_steps=select_steps,
-                )
-                fallback["analysis_backend_requested"] = self.requested_backend
-                fallback["analysis_backend_used"] = "heuristic"
-                fallback["analysis_error"] = str(exc)
-                return fallback
+            max_retries = 3
+            last_error: Optional[Exception] = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return self._analyze_episode_with_openai(
+                        steps=steps,
+                        candidate_step_indices=candidate_step_indices,
+                        select_steps=select_steps,
+                    )
+                except Exception as exc:  # pragma: no cover - runtime fallback
+                    last_error = exc
+                    if attempt < max_retries:
+                        logger.warning(
+                            "COPD OpenAI analysis attempt %s/%s failed, retrying: %s",
+                            attempt + 1,
+                            max_retries + 1,
+                            exc,
+                        )
+                    else:
+                        logger.warning("COPD OpenAI analysis failed, falling back to heuristic: %s", exc)
+
+            fallback = self._analyze_episode_with_heuristic(
+                steps=steps,
+                candidate_step_indices=candidate_step_indices,
+                select_steps=select_steps,
+            )
+            fallback["analysis_backend_requested"] = self.requested_backend
+            fallback["analysis_backend_used"] = "heuristic"
+            fallback["analysis_error"] = str(last_error) if last_error is not None else None
+            return fallback
         return self._analyze_episode_with_heuristic(
             steps=steps,
             candidate_step_indices=candidate_step_indices,
