@@ -294,7 +294,8 @@ algorithm:
   copd:
     step_advantage_w: 1.0
     teacher_advantage_w: 1.0
-    teacher_adv_disable_after_steps: null
+    phase_switch_after_steps: null
+    use_with_memory_after_phase_switch: False
     mode: "mean_norm"
     enable_similarity: False
     similarity_thresh: 0.95

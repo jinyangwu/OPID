@@ -44,6 +44,10 @@ class EnvironmentManagerBase:
         self.envs = envs
         self.projection_f = projection_f
         self.config = config
+        self._copd_use_with_memory = False
+
+    def set_copd_use_with_memory(self, enabled: bool) -> None:
+        self._copd_use_with_memory = bool(enabled)
 
     def reset(self, kwargs) -> Dict[str, Any]:
         """

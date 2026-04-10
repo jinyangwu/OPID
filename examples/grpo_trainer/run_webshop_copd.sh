@@ -18,17 +18,23 @@ COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
 COPD_TEACHER_ADV_W=0.1
-COPD_TEACHER_ADV_DISABLE_AFTER_STEPS=60
+COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-60}
+COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH=${COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH:-True}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
 COPD_STATS_TOPK_PER_TRAJ=3
 COPD_SIMILARITY_THRESH=0.95
+SKILLS_JSON_PATH=${SKILLS_JSON_PATH:-memory_data/webshop/claude_style_skills.json}
+SKILL_RETRIEVAL_MODE=${SKILL_RETRIEVAL_MODE:-embedding}
+EMBEDDING_MODEL_PATH=${EMBEDDING_MODEL_PATH:-$MODELS_ROOT/Qwen3-Embedding-0.6B}
+SKILL_TOP_K=${SKILL_TOP_K:-15}
+SKILL_TASK_SPECIFIC_TOP_K=${SKILL_TASK_SPECIFIC_TOP_K:-5}
 
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_stats_his-5
+EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_stats_exit-60_mem
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
-history_length=5
+history_length=2
 # We only use data preparation to indicate the modality and the data size.
 python3 -m examples.data_preprocess.prepare \
     --mode text \
@@ -74,7 +80,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
-    algorithm.copd.teacher_adv_disable_after_steps=$COPD_TEACHER_ADV_DISABLE_AFTER_STEPS \
+    algorithm.copd.phase_switch_after_steps=$COPD_PHASE_SWITCH_AFTER_STEPS \
+    algorithm.copd.use_with_memory_after_phase_switch=$COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH \
     algorithm.copd.mode=$COPD_MODE \
     algorithm.copd.selector=$COPD_SELECTOR \
     algorithm.copd.enable_similarity=False \
@@ -94,15 +101,21 @@ python3 -m verl.trainer.main_ppo \
     env.max_steps=15 \
     env.rollout.n=$GROUP_SIZE \
     env.resources_per_worker.num_cpus=$NUM_CPUS_PER_ENV_WORKER \
+    +env.use_skills_only_memory=True \
+    +env.skills_only_memory.skills_json_path=$SKILLS_JSON_PATH \
+    +env.skills_only_memory.retrieval_mode=$SKILL_RETRIEVAL_MODE \
+    +env.skills_only_memory.embedding_model_path=$EMBEDDING_MODEL_PATH \
+    +env.skills_only_memory.top_k=$SKILL_TOP_K \
+    +env.skills_only_memory.task_specific_top_k=$SKILL_TASK_SPECIFIC_TOP_K \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=150 \
+    trainer.total_epochs=160 \
     trainer.val_before_train=False \
     trainer.default_local_dir=$DEFAULT_LOCAL_DIR \
     trainer.rollout_data_dir=$DEFAULT_LOCAL_DIR

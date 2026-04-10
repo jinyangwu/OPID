@@ -10,7 +10,7 @@ while true; do
         # bash scripts/cold_start/all_1.5b_4.sh
         # bash examples/gtpo_trainer/ys_run_alfworld_branch_cs_bsz16_wo_p.sh
         # bash scripts/cold_start/all_7b_4.sh
-        bash examples/grpo_trainer/run_alfworld_copd.sh
+        bash examples/grpo_trainer/run_webshop_copd.sh
         # bash examples/gtpo_trainer/7b_ys_run_alfworld_branch_cs_bsz16_wo_p_L2.sh
         break  # 跑完脚本跳出循环
     else

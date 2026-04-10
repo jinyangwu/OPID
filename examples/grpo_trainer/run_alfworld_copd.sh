@@ -13,19 +13,23 @@ GROUP_SIZE=8
 NUM_CPUS_PER_ENV_WORKER=0.1
 
 COPD_MODE=mean_norm
-COPD_SELECTOR=llm
+COPD_SELECTOR=stats
 COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
 COPD_TEACHER_ADV_W=0.1
-COPD_TEACHER_ADV_DISABLE_AFTER_STEPS=${COPD_TEACHER_ADV_DISABLE_AFTER_STEPS:-null}
+COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-60}
+COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH=${COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH:-True}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
-COPD_STATS_TOPK_PER_TRAJ=3
+COPD_STATS_TOPK_PER_TRAJ=6
 COPD_SIMILARITY_THRESH=0.95
+SKILLS_JSON_PATH=${SKILLS_JSON_PATH:-memory_data/alfworld/claude_style_skills.json}
+SKILL_RETRIEVAL_MODE=${SKILL_RETRIEVAL_MODE:-template}
+SKILL_TOP_K=${SKILL_TOP_K:-6}
 
 PROJECT_NAME=agentic_alfworld
-EXPERIMENT_NAME=copd_qwen2.5_1.5b_alfworld
+EXPERIMENT_NAME=copd_qwen2.5_1.5b_alfworld_stats_topk-6_exit-60
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 history_length=5
@@ -41,7 +45,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$TRAIN_DATA_SIZE \
     data.val_batch_size=$VAL_DATA_SIZE \
-    data.max_prompt_length=2048 \
+    data.max_prompt_length=3048 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation=left \
@@ -74,7 +78,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
-    algorithm.copd.teacher_adv_disable_after_steps=$COPD_TEACHER_ADV_DISABLE_AFTER_STEPS \
+    algorithm.copd.phase_switch_after_steps=$COPD_PHASE_SWITCH_AFTER_STEPS \
+    algorithm.copd.use_with_memory_after_phase_switch=$COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH \
     algorithm.copd.mode=$COPD_MODE \
     algorithm.copd.selector=$COPD_SELECTOR \
     algorithm.copd.enable_similarity=False \
@@ -86,7 +91,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.analysis_backend=$COPD_ANALYSIS_BACKEND \
     algorithm.copd.analysis_num_workers=$COPD_ANALYSIS_NUM_WORKERS \
     algorithm.copd.analysis_max_history_steps=15 \
-    algorithm.copd.analysis_max_completion_tokens=1024 \
+    algorithm.copd.analysis_max_completion_tokens=4096 \
     algorithm.copd.normalize_teacher_adv=False \
     env.history_length=$history_length \
     env.env_name=alfworld/AlfredTWEnv \
@@ -94,6 +99,10 @@ python3 -m verl.trainer.main_ppo \
     env.max_steps=30 \
     env.rollout.n=$GROUP_SIZE \
     env.resources_per_worker.num_cpus=$NUM_CPUS_PER_ENV_WORKER \
+    +env.use_skills_only_memory=True \
+    +env.skills_only_memory.skills_json_path=$SKILLS_JSON_PATH \
+    +env.skills_only_memory.retrieval_mode=$SKILL_RETRIEVAL_MODE \
+    +env.skills_only_memory.top_k=$SKILL_TOP_K \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \

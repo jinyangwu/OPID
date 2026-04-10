@@ -228,7 +228,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.extract_task(text_obs)
 
         # Retrieve memories for each task if enabled
-        if self.retrieval_memory is not None:
+        if self.retrieval_memory is not None and self._copd_use_with_memory:
             self.retrieved_memories = []
 
             # Determine which config to use
@@ -246,6 +246,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     include_examples=mem_config.get('include_examples', False)
                 )
                 self.retrieved_memories.append(memories)
+        else:
+            self.retrieved_memories = None
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
@@ -285,6 +287,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         This function builds the text observation for the agent.
         """
         postprocess_text_obs = []
+        memory_contexts = [""] * len(text_obs)
+        valid_lens = [0] * len(text_obs)
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
@@ -298,14 +302,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # Use retrieval memory template if enabled
             use_retrieval = (self.retrieval_memory is not None and
                            self.retrieved_memories is not None and
-                           not init)
+                           self._copd_use_with_memory)
 
-            if init or self.config.env.history_length <= 0:
-                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
-                    current_observation=text_obs[i],
-                    admissible_actions=reformatted_admissible_actions
-                )
-            elif use_retrieval:
+            step_count = 0 if init else len(self.memory[i])
+            current_step = 1 if init else len(self.memory[i]) + 1
+
+            if use_retrieval:
                 # Format retrieved memories for prompt
                 memory_context = self.retrieval_memory.format_for_prompt(
                     self.retrieved_memories[i]
@@ -313,20 +315,25 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 obs = ALFWORLD_TEMPLATE_WITH_MEMORY.format(
                     task_description=self.tasks[i],
                     retrieved_memories=memory_context,
-                    step_count=len(self.memory[i]),
+                    step_count=step_count,
                     history_length=valid_lens[i],
                     action_history=memory_contexts[i],
-                    current_step=len(self.memory[i]) + 1,
+                    current_step=current_step,
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+            elif init or self.config.env.history_length <= 0:
+                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
                 obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
-                    step_count=len(self.memory[i]),
+                    step_count=step_count,
                     history_length=valid_lens[i],
                     action_history=memory_contexts[i],
-                    current_step=len(self.memory[i]) + 1,
+                    current_step=current_step,
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
@@ -559,7 +566,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         obs = self.format_obs(obs)
 
         # Retrieve skills for each task if memory is configured
-        if self.retrieval_memory is not None:
+        if self.retrieval_memory is not None and self._copd_use_with_memory:
             mem_cfg = self.config.env.skills_only_memory
             self.retrieved_memories = [
                 self.retrieval_memory.retrieve(
@@ -568,6 +575,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 )
                 for task in self.tasks
             ]
+        else:
+            self.retrieved_memories = None
 
         observations = {'text': self.build_text_obs(obs, infos, init=True),
                         'image': None,
@@ -643,6 +652,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         This function builds the text observation for the agent.
         """
         postprocess_text_obs = []
+        memory_contexts = [""] * len(text_obs)
+        valid_lens = [0] * len(text_obs)
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
@@ -652,41 +663,43 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         use_retrieval = (
             self.retrieval_memory is not None
             and self.retrieved_memories is not None
-            and not init
+            and self._copd_use_with_memory
         )
 
         for i in range(len(text_obs)):
 
             available_actions = self.format_avail_actions(infos[i]['available_actions'])
             reformatted_available_actions = "\n".join(f"'{s}'," for s in available_actions)
+            step_count = 0 if init else len(self.memory[i])
+            current_step = 1 if init else len(self.memory[i]) + 1
 
-            if init or self.config.env.history_length <= 0:
-                obs = WEBSHOP_TEMPLATE_NO_HIS.format(
-                    task_description=self.tasks[i],
-                    current_observation=text_obs[i],
-                    available_actions=reformatted_available_actions
-                )
-            elif use_retrieval:
+            if use_retrieval:
                 memory_context = self.retrieval_memory.format_for_prompt(
                     self.retrieved_memories[i]
                 )
                 obs = WEBSHOP_TEMPLATE_WITH_MEMORY.format(
                     task_description=self.tasks[i],
                     retrieved_memories=memory_context,
-                    step_count=len(self.memory[i]),
+                    step_count=step_count,
                     history_length=valid_lens[i],
                     action_history=memory_contexts[i],
-                    current_step=len(self.memory[i]) + 1,
+                    current_step=current_step,
+                    current_observation=text_obs[i],
+                    available_actions=reformatted_available_actions
+                )
+            elif init or self.config.env.history_length <= 0:
+                obs = WEBSHOP_TEMPLATE_NO_HIS.format(
+                    task_description=self.tasks[i],
                     current_observation=text_obs[i],
                     available_actions=reformatted_available_actions
                 )
             else:
                 obs = WEBSHOP_TEMPLATE.format(
                     task_description=self.tasks[i],
-                    step_count=len(self.memory[i]),
+                    step_count=step_count,
                     history_length=valid_lens[i],
                     action_history=memory_contexts[i],
-                    current_step=len(self.memory[i]) + 1,
+                    current_step=current_step,
                     current_observation=text_obs[i],
                     available_actions=reformatted_available_actions
                 )

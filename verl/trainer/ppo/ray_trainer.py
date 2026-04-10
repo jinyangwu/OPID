@@ -474,6 +474,8 @@ class RayPPOTrainer:
         self.val_envs = val_envs
         self._copd_analyzer = None
         self._copd_teacher_adv_last_enabled_state = None
+        self._copd_with_memory_last_enabled_state = None
+        self._copd_with_memory_missing_skills_warned = False
         self.traj_collector = traj_collector
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -517,30 +519,55 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-    def _get_copd_teacher_adv_disable_after_steps(self) -> Optional[int]:
-        disable_after_steps = OmegaConf.select(self.config, "algorithm.copd.teacher_adv_disable_after_steps")
-        if disable_after_steps is None:
+    def _get_copd_phase_switch_after_steps(self) -> Optional[int]:
+        phase_switch_after_steps = OmegaConf.select(self.config, "algorithm.copd.phase_switch_after_steps")
+        if phase_switch_after_steps is None:
             return None
-        return int(disable_after_steps)
+        return int(phase_switch_after_steps)
+
+    def _should_copd_use_with_memory_rollout(self) -> bool:
+        phase_switch_after_steps = self._get_copd_phase_switch_after_steps()
+        enabled = bool(OmegaConf.select(self.config, "algorithm.copd.use_with_memory_after_phase_switch"))
+        enabled = enabled and phase_switch_after_steps is not None and self.global_steps > phase_switch_after_steps
+
+        if enabled and not self.config.env.get("use_skills_only_memory", False):
+            if not self._copd_with_memory_missing_skills_warned:
+                module_logger.warning(
+                    "COPD with-memory rollout was requested after the phase switch, but env.use_skills_only_memory is not enabled. Falling back to plain rollout prompts."
+                )
+                self._copd_with_memory_missing_skills_warned = True
+            enabled = False
+
+        if self._copd_with_memory_last_enabled_state != enabled:
+            module_logger.info(
+                "COPD rollout WITH_MEMORY template is %s at global_step=%s.",
+                "enabled" if enabled else "disabled",
+                self.global_steps,
+            )
+            self._copd_with_memory_last_enabled_state = enabled
+        return enabled
+
+    def _set_copd_use_with_memory(self, env_manager, use_with_memory: bool) -> None:
+        env_manager.set_copd_use_with_memory(use_with_memory)
 
     def _is_copd_teacher_adv_enabled(self) -> bool:
-        disable_after_steps = self._get_copd_teacher_adv_disable_after_steps()
-        if disable_after_steps is None:
+        phase_switch_after_steps = self._get_copd_phase_switch_after_steps()
+        if phase_switch_after_steps is None:
             return True
 
-        enabled = self.global_steps <= disable_after_steps
+        enabled = self.global_steps <= phase_switch_after_steps
         if self._copd_teacher_adv_last_enabled_state != enabled:
             if enabled:
                 module_logger.info(
                     "COPD teacher advantage is enabled at global_step=%s and will be disabled after step %s.",
                     self.global_steps,
-                    disable_after_steps,
+                    phase_switch_after_steps,
                 )
             else:
                 module_logger.info(
-                    "COPD teacher advantage is disabled at global_step=%s because teacher_adv_disable_after_steps=%s.",
+                    "COPD teacher advantage is disabled at global_step=%s because phase_switch_after_steps=%s.",
                     self.global_steps,
-                    disable_after_steps,
+                    phase_switch_after_steps,
                 )
             self._copd_teacher_adv_last_enabled_state = enabled
         return enabled
@@ -562,9 +589,13 @@ class RayPPOTrainer:
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        teacher_adv_disable_after_steps = OmegaConf.select(config, "algorithm.copd.teacher_adv_disable_after_steps")
-        if teacher_adv_disable_after_steps is not None and int(teacher_adv_disable_after_steps) < 0:
-            raise ValueError("algorithm.copd.teacher_adv_disable_after_steps must be null or a non-negative integer.")
+        phase_switch_after_steps = OmegaConf.select(config, "algorithm.copd.phase_switch_after_steps")
+        if phase_switch_after_steps is not None and int(phase_switch_after_steps) < 0:
+            raise ValueError("algorithm.copd.phase_switch_after_steps must be null or a non-negative integer.")
+        if OmegaConf.select(config, "algorithm.copd.use_with_memory_after_phase_switch") and phase_switch_after_steps is None:
+            module_logger.warning(
+                "algorithm.copd.use_with_memory_after_phase_switch is enabled but algorithm.copd.phase_switch_after_steps is null, so the WITH_MEMORY rollout phase will never be reached."
+            )
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
@@ -900,6 +931,10 @@ class RayPPOTrainer:
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
+            if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
+                copd_teacher_adv_enabled = self._is_copd_teacher_adv_enabled()
+                copd_with_memory_enabled = self._should_copd_use_with_memory_rollout()
+                self._set_copd_use_with_memory(self.val_envs, use_with_memory=copd_with_memory_enabled)
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # # pad to be divisible by dp_size
@@ -1768,7 +1803,10 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
-                    copd_teacher_adv_enabled = True
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
+                        copd_teacher_adv_enabled = self._is_copd_teacher_adv_enabled()
+                        copd_with_memory_enabled = self._should_copd_use_with_memory_rollout()
+                        self._set_copd_use_with_memory(self.envs, use_with_memory=copd_with_memory_enabled)
                     # generate a batch
                     with _timer("gen", timing_raw):
                         # if not self.async_rollout_mode:
@@ -1815,9 +1853,9 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
-                        copd_teacher_adv_enabled = self._is_copd_teacher_adv_enabled()
                         metrics["copd/teacher_enabled"] = 1.0 if copd_teacher_adv_enabled else 0.0
                         metrics["copd/teacher_disabled_by_schedule"] = 0.0 if copd_teacher_adv_enabled else 1.0
+                        metrics["copd/with_memory_enabled"] = 1.0 if copd_with_memory_enabled else 0.0
                         if copd_teacher_adv_enabled:
                             batch = self._prepare_copd_teacher_signals(batch=batch, metrics=metrics)
                         else:
