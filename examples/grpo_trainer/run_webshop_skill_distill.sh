@@ -20,7 +20,7 @@ STEP_ADV_W=${STEP_ADV_W:-1.0}
 PROJECT_NAME=${PROJECT_NAME:-agentic_webshop}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-skill_distill_qwen2.5_1.5b_webshop}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
-EMBEDDING_MODEL_PATH=${EMBEDDING_MODEL_PATH:-/raid3/data/GTPO/Qwen3-Embedding-0.6B}
+EMBEDDING_MODEL_PATH=${EMBEDDING_MODEL_PATH:-$MODELS_ROOT/Qwen3-Embedding-0.6B}
 
 python3 -m examples.data_preprocess.prepare \
     --mode text \

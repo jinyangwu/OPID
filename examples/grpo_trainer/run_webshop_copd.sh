@@ -18,16 +18,17 @@ COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
 COPD_TEACHER_ADV_W=0.1
+COPD_TEACHER_ADV_DISABLE_AFTER_STEPS=60
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
 COPD_STATS_TOPK_PER_TRAJ=3
 COPD_SIMILARITY_THRESH=0.95
 
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_5-3
+EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_stats_his-5
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
-history_length=2
+history_length=5
 # We only use data preparation to indicate the modality and the data size.
 python3 -m examples.data_preprocess.prepare \
     --mode text \
@@ -40,10 +41,10 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$TRAIN_DATA_SIZE \
     data.val_batch_size=$VAL_DATA_SIZE \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=6000 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
-    data.truncation=error \
+    data.truncation=left \
     data.return_raw_chat=True \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -73,6 +74,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
+    algorithm.copd.teacher_adv_disable_after_steps=$COPD_TEACHER_ADV_DISABLE_AFTER_STEPS \
     algorithm.copd.mode=$COPD_MODE \
     algorithm.copd.selector=$COPD_SELECTOR \
     algorithm.copd.enable_similarity=False \

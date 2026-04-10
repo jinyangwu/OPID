@@ -18,6 +18,7 @@ COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
 COPD_TEACHER_ADV_W=0.1
+COPD_TEACHER_ADV_DISABLE_AFTER_STEPS=${COPD_TEACHER_ADV_DISABLE_AFTER_STEPS:-null}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
 COPD_STATS_TOPK_PER_TRAJ=3
@@ -73,6 +74,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
+    algorithm.copd.teacher_adv_disable_after_steps=$COPD_TEACHER_ADV_DISABLE_AFTER_STEPS \
     algorithm.copd.mode=$COPD_MODE \
     algorithm.copd.selector=$COPD_SELECTOR \
     algorithm.copd.enable_similarity=False \

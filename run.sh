@@ -13,3 +13,7 @@ bash examples/grpo_trainer/run_webshop_skills.sh
 
 
 python scripts/test_openai_api.py --env-file .env --show-reasoning --dump-response --json-output
+
+conda activate retriever
+local_dir=$MODELS_ROOT/data/searchR1
+python examples/search/searchr1_download.py --local_dir $local_dir

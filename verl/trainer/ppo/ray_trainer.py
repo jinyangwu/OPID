@@ -473,6 +473,7 @@ class RayPPOTrainer:
         self.envs = envs
         self.val_envs = val_envs
         self._copd_analyzer = None
+        self._copd_teacher_adv_last_enabled_state = None
         self.traj_collector = traj_collector
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -516,10 +517,54 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+    def _get_copd_teacher_adv_disable_after_steps(self) -> Optional[int]:
+        disable_after_steps = OmegaConf.select(self.config, "algorithm.copd.teacher_adv_disable_after_steps")
+        if disable_after_steps is None:
+            return None
+        return int(disable_after_steps)
+
+    def _is_copd_teacher_adv_enabled(self) -> bool:
+        disable_after_steps = self._get_copd_teacher_adv_disable_after_steps()
+        if disable_after_steps is None:
+            return True
+
+        enabled = self.global_steps <= disable_after_steps
+        if self._copd_teacher_adv_last_enabled_state != enabled:
+            if enabled:
+                module_logger.info(
+                    "COPD teacher advantage is enabled at global_step=%s and will be disabled after step %s.",
+                    self.global_steps,
+                    disable_after_steps,
+                )
+            else:
+                module_logger.info(
+                    "COPD teacher advantage is disabled at global_step=%s because teacher_adv_disable_after_steps=%s.",
+                    self.global_steps,
+                    disable_after_steps,
+                )
+            self._copd_teacher_adv_last_enabled_state = enabled
+        return enabled
+
+    def _set_zero_copd_teacher_signals(self, batch: DataProto, metrics: Dict[str, float]) -> DataProto:
+        batch_size = len(batch)
+        batch.batch["teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        batch.batch["critical_step_mask"] = torch.zeros(
+            batch_size,
+            dtype=torch.bool,
+            device=batch.batch["responses"].device,
+        )
+        metrics["copd/critical_step_ratio"] = 0.0
+        metrics["copd/teacher_batch_size"] = 0.0
+        metrics["copd/teacher_available"] = 0.0
+        return batch
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+        teacher_adv_disable_after_steps = OmegaConf.select(config, "algorithm.copd.teacher_adv_disable_after_steps")
+        if teacher_adv_disable_after_steps is not None and int(teacher_adv_disable_after_steps) < 0:
+            raise ValueError("algorithm.copd.teacher_adv_disable_after_steps must be null or a non-negative integer.")
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
@@ -1723,6 +1768,7 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
+                    copd_teacher_adv_enabled = True
                     # generate a batch
                     with _timer("gen", timing_raw):
                         # if not self.async_rollout_mode:
@@ -1769,7 +1815,18 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
-                        batch = self._prepare_copd_teacher_signals(batch=batch, metrics=metrics)
+                        copd_teacher_adv_enabled = self._is_copd_teacher_adv_enabled()
+                        metrics["copd/teacher_enabled"] = 1.0 if copd_teacher_adv_enabled else 0.0
+                        metrics["copd/teacher_disabled_by_schedule"] = 0.0 if copd_teacher_adv_enabled else 1.0
+                        if copd_teacher_adv_enabled:
+                            batch = self._prepare_copd_teacher_signals(batch=batch, metrics=metrics)
+                        else:
+                            batch = self._set_zero_copd_teacher_signals(batch=batch, metrics=metrics)
+                            metrics["copd/analysis_num_requests"] = 0.0
+                            metrics["copd/analysis_num_workers"] = 0.0
+                            metrics["copd/selector_num_groups"] = 0.0
+                            metrics["copd/selector_eligible_groups"] = 0.0
+                            metrics["copd/selector_variance_cutoff"] = 0.0
                     
                     batch = adjust_batch(self.config, batch)
 
@@ -1873,6 +1930,9 @@ class RayPPOTrainer:
                         # compute advantages, executed on the driver process
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                        copd_teacher_advantage_w = self.config.algorithm.copd.teacher_advantage_w
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD and not copd_teacher_adv_enabled:
+                            copd_teacher_advantage_w = 0.0
 
                         batch = compute_advantage(
                             batch,
@@ -1893,7 +1953,7 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
-                            teacher_advantage_w=self.config.algorithm.copd.teacher_advantage_w,
+                            teacher_advantage_w=copd_teacher_advantage_w,
                             copd_mode=self.config.algorithm.copd.mode,
                             copd_enable_similarity=self.config.algorithm.copd.enable_similarity,
                             copd_similarity_thresh=self.config.algorithm.copd.similarity_thresh,

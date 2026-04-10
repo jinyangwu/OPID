@@ -22,7 +22,6 @@
       .boxTitle { font: 700 23px 'Avenir Next', 'Helvetica Neue', 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
       .boxText { font: 500 18px 'Avenir Next', 'Helvetica Neue', 'Segoe UI', Arial, sans-serif; fill: #334155; }
       .smallText { font: 500 16px 'Avenir Next', 'Helvetica Neue', 'Segoe UI', Arial, sans-serif; fill: #475569; }
-      .formula { font: 600 17px 'Menlo', 'Consolas', monospace; fill: #0F172A; }
       .pill { font: 700 14px 'Avenir Next', 'Helvetica Neue', 'Segoe UI', Arial, sans-serif; fill: #0F172A; letter-spacing: 0.08em; }
     </style>
   </defs>
@@ -31,7 +30,7 @@
   <rect x="40" y="34" width="1520" height="76" rx="24" fill="url(#headerBand)" opacity="0.75"/>
 
   <text class="title" x="70" y="82">COPD Framework: Critical-Step Hindsight Shaping for PPO</text>
-  <text class="subtitle" x="70" y="114">Horizontal presentation layout aligned with the repository implementation: critical-step selection, hindsight teacher scoring, and advantage fusion.</text>
+  <text class="subtitle" x="70" y="114">Conceptual overview of critical-step discovery, hindsight teacher guidance, and advantage fusion.</text>
 
   <text class="section" x="86" y="168">1. BATCH AND EPISODE BUILDING</text>
   <text class="section" x="592" y="168">2. CRITICAL-STEP DISCOVERY</text>
@@ -47,28 +46,28 @@
   <rect x="312" y="210" width="220" height="122" rx="24" fill="#F8FAFC" stroke="#94A3B8" stroke-width="2.4" filter="url(#shadow)"/>
   <text class="boxTitle" x="343" y="256">Trajectory</text>
   <text class="boxTitle" x="343" y="283">Reconstruction</text>
-  <text class="boxText" x="343" y="313">Group by traj_uid and</text>
-  <text class="boxText" x="343" y="338">build step-level episodes</text>
+  <text class="boxText" x="343" y="313">Rebuild each episode</text>
+  <text class="boxText" x="343" y="338">from rollout steps</text>
 
   <rect x="560" y="192" width="410" height="270" rx="30" fill="#FFF9ED" stroke="#F59E0B" stroke-width="2.6" filter="url(#shadow)"/>
   <rect x="585" y="215" width="160" height="34" rx="17" fill="#FDE68A"/>
   <text class="pill" x="615" y="237">SELECTOR A</text>
   <rect x="594" y="260" width="160" height="126" rx="22" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2"/>
   <text class="boxTitle" x="620" y="300">Stats Selector</text>
-  <text class="smallText" x="620" y="332">Anchor-state grouping</text>
-  <text class="smallText" x="620" y="356">High variance groups</text>
-  <text class="smallText" x="620" y="380">Top-k weak steps</text>
+  <text class="smallText" x="620" y="332">State grouping</text>
+  <text class="smallText" x="620" y="356">High-variance regions</text>
+  <text class="smallText" x="620" y="380">Weak-step selection</text>
 
   <rect x="787" y="215" width="160" height="34" rx="17" fill="#FCD34D"/>
   <text class="pill" x="818" y="237">SELECTOR B</text>
   <rect x="778" y="260" width="160" height="126" rx="22" fill="#FFFBEB" stroke="#D97706" stroke-width="2"/>
   <text class="boxTitle" x="812" y="300">LLM Selector</text>
-  <text class="smallText" x="804" y="332">Analyze trajectory</text>
-  <text class="smallText" x="800" y="356">Choose critical steps</text>
-  <text class="smallText" x="804" y="380">Generate hints</text>
+  <text class="smallText" x="804" y="332">Trajectory analysis</text>
+  <text class="smallText" x="800" y="356">Critical-step choice</text>
+  <text class="smallText" x="804" y="380">Hindsight guidance</text>
 
   <rect x="640" y="404" width="250" height="38" rx="19" fill="#FFF1CC" stroke="#F59E0B" stroke-width="1.8"/>
-  <text class="smallText" x="684" y="428">Critical Step Mask + Hints</text>
+  <text class="smallText" x="688" y="428">Selected Critical Steps</text>
 
   <rect x="1020" y="210" width="238" height="122" rx="24" fill="#ECFDF5" stroke="#10B981" stroke-width="2.4" filter="url(#shadow)"/>
   <text class="boxTitle" x="1053" y="256">Enhanced</text>
@@ -79,42 +78,40 @@
   <rect x="1300" y="210" width="210" height="122" rx="24" fill="#ECFDF5" stroke="#059669" stroke-width="2.4" filter="url(#shadow)"/>
   <text class="boxTitle" x="1329" y="256">Teacher</text>
   <text class="boxTitle" x="1329" y="283">Scoring</text>
-  <text class="boxText" x="1329" y="313">Score original response</text>
-  <text class="boxText" x="1329" y="338">under enhanced prompt</text>
+  <text class="boxText" x="1329" y="313">Evaluate the original</text>
+  <text class="boxText" x="1329" y="338">response with context</text>
 
   <rect x="118" y="580" width="242" height="130" rx="24" fill="#EEF6FF" stroke="#2563EB" stroke-width="2.4" filter="url(#shadow)"/>
   <text class="boxTitle" x="149" y="626">Episode</text>
   <text class="boxTitle" x="149" y="653">Advantage</text>
-  <text class="boxText" x="149" y="683">Relative return across</text>
-  <text class="boxText" x="149" y="708">trajectory groups</text>
+  <text class="boxText" x="149" y="683">Trajectory-level</text>
+  <text class="boxText" x="149" y="708">feedback signal</text>
 
   <rect x="405" y="580" width="242" height="130" rx="24" fill="#F0FDFA" stroke="#0F766E" stroke-width="2.4" filter="url(#shadow)"/>
   <text class="boxTitle" x="438" y="626">Step</text>
   <text class="boxTitle" x="438" y="653">Advantage</text>
-  <text class="boxText" x="438" y="683">Relative step reward</text>
-  <text class="boxText" x="438" y="708">within anchor-state groups</text>
+  <text class="boxText" x="438" y="683">State-relative</text>
+  <text class="boxText" x="438" y="708">step feedback</text>
 
   <rect x="748" y="552" width="300" height="158" rx="26" fill="#F0FDF4" stroke="#16A34A" stroke-width="2.6" filter="url(#shadow)"/>
   <text class="boxTitle" x="781" y="598">Teacher Advantage</text>
-  <text class="boxText" x="781" y="630">Log-prob improvement on</text>
-  <text class="boxText" x="781" y="655">critical steps only</text>
-  <text class="formula" x="781" y="694">(teacher_log_prob - old_log_prob)</text>
-  <text class="formula" x="781" y="721">* response_mask * critical_mask</text>
+  <text class="boxText" x="781" y="632">Teacher-guided</text>
+  <text class="boxText" x="781" y="660">feedback on selected</text>
+  <text class="boxText" x="781" y="688">critical steps</text>
 
   <rect x="1110" y="565" width="265" height="145" rx="26" fill="#FFF7ED" stroke="#EA580C" stroke-width="2.8" filter="url(#shadow)"/>
   <text class="boxTitle" x="1142" y="611">Final COPD</text>
   <text class="boxTitle" x="1142" y="638">Advantage</text>
-  <text class="formula" x="1142" y="676">A = A_episode</text>
-  <text class="formula" x="1142" y="701">+ w_step * A_step</text>
-  <text class="formula" x="1142" y="726">+ w_teacher * A_teacher</text>
+  <text class="boxText" x="1142" y="678">Fuse episode, step,</text>
+  <text class="boxText" x="1142" y="706">and teacher feedback</text>
 
   <rect x="1420" y="580" width="130" height="130" rx="24" fill="#F8FAFC" stroke="#475569" stroke-width="2.4" filter="url(#shadow)"/>
   <text class="boxTitle" x="1450" y="640">PPO</text>
   <text class="boxTitle" x="1440" y="668">Update</text>
 
   <rect x="1220" y="382" width="290" height="60" rx="20" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1.8" stroke-dasharray="8 8"/>
-  <text class="smallText" x="1253" y="406">If no critical step is selected,</text>
-  <text class="smallText" x="1253" y="429">teacher signal falls back to zero.</text>
+  <text class="smallText" x="1266" y="406">If no critical step is selected,</text>
+  <text class="smallText" x="1268" y="429">teacher guidance is skipped.</text>
 
   <path d="M270 271H312" stroke="#475569" stroke-width="3" stroke-linecap="round" marker-end="url(#arrow)"/>
   <path d="M532 271H560" stroke="#475569" stroke-width="3" stroke-linecap="round" marker-end="url(#arrow)"/>
