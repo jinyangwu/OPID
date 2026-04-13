@@ -17,3 +17,6 @@ python scripts/test_openai_api.py --env-file .env --show-reasoning --dump-respon
 conda activate retriever
 local_dir=$MODELS_ROOT/data/searchR1
 python examples/search/searchr1_download.py --local_dir $local_dir
+
+export HF_ENDPOINT=https://hf-mirror.com
+huggingface-cli download --resume-download Qwen/Qwen3-Embedding-0.6B --local-dir /raid3/data/GTPO/MODELS/Qwen3-Embedding-0.6B

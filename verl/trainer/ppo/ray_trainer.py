@@ -391,7 +391,7 @@ def compute_advantage(
         else:
             critical_step_mask = None
 
-        advantages, returns = core_gigpo.compute_copd_outcome_advantage(
+        advantages, returns, copd_adv_metrics = core_gigpo.compute_copd_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
             step_rewards=data.batch['step_rewards'],
             response_mask=data.batch['response_mask'],
@@ -408,9 +408,13 @@ def compute_advantage(
             similarity_thresh=copd_similarity_thresh,
             normalize_teacher_adv=copd_normalize_teacher_adv,
             clip_teacher_adv=copd_clip_teacher_adv,
+            return_metrics=True,
         )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+        if data.meta_info is None:
+            data.meta_info = {}
+        data.meta_info["copd_adv_metrics"] = copd_adv_metrics
     else:
         raise NotImplementedError
     return data
@@ -1998,6 +2002,8 @@ class RayPPOTrainer:
                             copd_normalize_teacher_adv=self.config.algorithm.copd.normalize_teacher_adv,
                             copd_clip_teacher_adv=self.config.algorithm.copd.clip_teacher_adv,
                         )
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
+                            metrics.update(batch.meta_info.pop("copd_adv_metrics", {}))
 
                     # update critic
                     if self.use_critic:

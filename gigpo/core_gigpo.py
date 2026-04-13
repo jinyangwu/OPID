@@ -20,7 +20,7 @@ from verl import DataProto
 import uuid
 
 from difflib import SequenceMatcher
-from typing import Sequence, List, Dict, Any, Optional
+from typing import Sequence, List, Dict, Any, Optional, Tuple
 
 
 """
@@ -245,6 +245,153 @@ def compute_teacher_token_advantage(
 
     return teacher_advantages
 
+
+def summarize_copd_advantage_components(
+    response_mask: torch.Tensor,
+    episode_advantages: torch.Tensor,
+    step_advantages: torch.Tensor,
+    teacher_advantages: torch.Tensor,
+    step_advantage_w: float = 1.0,
+    teacher_advantage_w: float = 1.0,
+    epsilon: float = 1e-6,
+) -> Dict[str, float]:
+    """
+    Summarize the relative contribution of the three COPD advantage terms.
+
+    The reported share is based on the weighted absolute mean magnitude of each
+    component over valid response tokens:
+        episode_adv
+        step_advantage_w * step_adv
+        teacher_advantage_w * teacher_adv
+    """
+    valid_mask = response_mask > 0
+    def _summarize(prefix: str, components: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        if not valid_mask.any():
+            return {
+                f"{prefix}/episode_mean": 0.0,
+                f"{prefix}/step_mean": 0.0,
+                f"{prefix}/teacher_mean": 0.0,
+                f"{prefix}/episode_abs_mean": 0.0,
+                f"{prefix}/step_abs_mean": 0.0,
+                f"{prefix}/teacher_abs_mean": 0.0,
+                f"{prefix}/episode_share": 0.0,
+                f"{prefix}/step_share": 0.0,
+                f"{prefix}/teacher_share": 0.0,
+                f"{prefix}/total_abs_mean": 0.0,
+            }
+
+        mean_metrics: Dict[str, float] = {}
+        abs_mean_metrics: Dict[str, float] = {}
+        for name, component in components.items():
+            valid_values = component.detach()[valid_mask]
+            mean_metrics[name] = float(valid_values.mean().cpu().item())
+            abs_mean_metrics[name] = float(valid_values.abs().mean().cpu().item())
+
+        total_abs_mean = sum(abs_mean_metrics.values())
+        return {
+            f"{prefix}/episode_mean": mean_metrics["episode"],
+            f"{prefix}/step_mean": mean_metrics["step"],
+            f"{prefix}/teacher_mean": mean_metrics["teacher"],
+            f"{prefix}/episode_abs_mean": abs_mean_metrics["episode"],
+            f"{prefix}/step_abs_mean": abs_mean_metrics["step"],
+            f"{prefix}/teacher_abs_mean": abs_mean_metrics["teacher"],
+            f"{prefix}/episode_share": abs_mean_metrics["episode"] / (total_abs_mean + epsilon),
+            f"{prefix}/step_share": abs_mean_metrics["step"] / (total_abs_mean + epsilon),
+            f"{prefix}/teacher_share": abs_mean_metrics["teacher"] / (total_abs_mean + epsilon),
+            f"{prefix}/total_abs_mean": total_abs_mean,
+        }
+
+    raw_components = {
+        "episode": episode_advantages,
+        "step": step_advantages,
+        "teacher": teacher_advantages,
+    }
+    weighted_components = {
+        "episode": episode_advantages,
+        "step": step_advantage_w * step_advantages,
+        "teacher": teacher_advantage_w * teacher_advantages,
+    }
+
+    teacher_active_token_ratio = float(
+        ((teacher_advantages.detach().abs() > 0) & valid_mask).float().sum().cpu().item()
+        / (valid_mask.float().sum().cpu().item() + epsilon)
+    ) if valid_mask.any() else 0.0
+
+    metrics = {}
+    metrics.update(_summarize("copd/adv_raw", raw_components))
+    metrics.update(_summarize("copd/adv", weighted_components))
+    metrics.update({
+        "copd/adv/teacher_active_token_ratio": teacher_active_token_ratio,
+        "copd/adv/step_weight": float(step_advantage_w),
+        "copd/adv/teacher_weight": float(teacher_advantage_w),
+    })
+    return metrics
+
+
+def compute_copd_advantage_components(
+    token_level_rewards: torch.Tensor,
+    step_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    anchor_obs: np.array,
+    index: np.array,
+    traj_index: np.array,
+    teacher_log_prob: Optional[torch.Tensor] = None,
+    old_log_prob: Optional[torch.Tensor] = None,
+    critical_step_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
+    epsilon: float = 1e-6,
+    step_advantage_w: float = 1.0,
+    teacher_advantage_w: float = 1.0,
+    mode: str = "mean_norm",
+    enable_similarity: bool = False,
+    similarity_thresh: float = 0.95,
+    normalize_teacher_adv: bool = False,
+    clip_teacher_adv: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the three token-level COPD advantage components and the weighted sum.
+    """
+    remove_std = _mode_to_remove_std(mode)
+
+    episode_advantages = episode_norm_reward(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        traj_index=traj_index,
+        epsilon=epsilon,
+        remove_std=remove_std,
+    )
+
+    step_group_uids = build_step_group(
+        anchor_obs=anchor_obs,
+        index=index,
+        enable_similarity=enable_similarity,
+        similarity_thresh=similarity_thresh,
+    )
+    step_advantages = step_norm_reward(
+        step_rewards=step_rewards,
+        response_mask=response_mask,
+        index=step_group_uids,
+        epsilon=epsilon,
+        remove_std=remove_std,
+    )
+
+    teacher_advantages = compute_teacher_token_advantage(
+        response_mask=response_mask,
+        teacher_log_prob=teacher_log_prob,
+        old_log_prob=old_log_prob,
+        critical_step_mask=critical_step_mask,
+        normalize=normalize_teacher_adv,
+        clip_range=clip_teacher_adv,
+        epsilon=epsilon,
+    )
+
+    scores = (
+        episode_advantages
+        + step_advantage_w * step_advantages
+        + teacher_advantage_w * teacher_advantages
+    )
+    return episode_advantages, step_advantages, teacher_advantages, scores
+
 # ---------------------------------------------------------- #
 # ---------------- Core Functions of GiGPO ----------------- #
 # ---------------------------------------------------------- #
@@ -297,6 +444,7 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
                                    similarity_thresh: float = 0.95,
                                    normalize_teacher_adv: bool = False,
                                    clip_teacher_adv: Optional[float] = None,
+                                   return_metrics: bool = False,
                                    ):
     """
     Compute the advantages for COPD.
@@ -306,46 +454,36 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
     where ``teacher_adv`` is derived from
         ``teacher_log_prob - old_log_prob``.
     """
-    remove_std = _mode_to_remove_std(mode)
-
-    episode_advantages = episode_norm_reward(
+    episode_advantages, step_advantages, teacher_advantages, scores = compute_copd_advantage_components(
         token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-        traj_index=traj_index,
-        epsilon=epsilon,
-        remove_std=remove_std,
-    )
-
-    step_group_uids = build_step_group(
-        anchor_obs=anchor_obs,
-        index=index,
-        enable_similarity=enable_similarity,
-        similarity_thresh=similarity_thresh,
-    )
-    step_advantages = step_norm_reward(
         step_rewards=step_rewards,
         response_mask=response_mask,
-        index=step_group_uids,
-        epsilon=epsilon,
-        remove_std=remove_std,
-    )
-
-    teacher_advantages = compute_teacher_token_advantage(
-        response_mask=response_mask,
+        anchor_obs=anchor_obs,
+        index=index,
+        traj_index=traj_index,
         teacher_log_prob=teacher_log_prob,
         old_log_prob=old_log_prob,
         critical_step_mask=critical_step_mask,
-        normalize=normalize_teacher_adv,
-        clip_range=clip_teacher_adv,
         epsilon=epsilon,
+        step_advantage_w=step_advantage_w,
+        teacher_advantage_w=teacher_advantage_w,
+        mode=mode,
+        enable_similarity=enable_similarity,
+        similarity_thresh=similarity_thresh,
+        normalize_teacher_adv=normalize_teacher_adv,
+        clip_teacher_adv=clip_teacher_adv,
     )
-
-    scores = (
-        episode_advantages
-        + step_advantage_w * step_advantages
-        + teacher_advantage_w * teacher_advantages
-    )
+    if return_metrics:
+        component_metrics = summarize_copd_advantage_components(
+            response_mask=response_mask,
+            episode_advantages=episode_advantages,
+            step_advantages=step_advantages,
+            teacher_advantages=teacher_advantages,
+            step_advantage_w=step_advantage_w,
+            teacher_advantage_w=teacher_advantage_w,
+            epsilon=epsilon,
+        )
+        return scores, scores, component_metrics
     return scores, scores
 
 

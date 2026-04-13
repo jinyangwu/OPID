@@ -18,7 +18,7 @@ COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
 COPD_TEACHER_ADV_W=0.1
-COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-60}
+COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-0}
 COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH=${COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH:-True}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
@@ -29,7 +29,7 @@ SKILL_RETRIEVAL_MODE=${SKILL_RETRIEVAL_MODE:-template}
 SKILL_TOP_K=${SKILL_TOP_K:-6}
 
 PROJECT_NAME=agentic_alfworld
-EXPERIMENT_NAME=copd_qwen2.5_1.5b_alfworld_stats_topk-6_exit-60
+EXPERIMENT_NAME=copd_qwen2.5_1.5b_alfworld_stats_exit-0_mem
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 history_length=5
@@ -54,7 +54,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -107,11 +107,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=150 \
+    trainer.total_epochs=160 \
     trainer.val_before_train=False \
     trainer.default_local_dir=$DEFAULT_LOCAL_DIR \
     trainer.rollout_data_dir=$DEFAULT_LOCAL_DIR
