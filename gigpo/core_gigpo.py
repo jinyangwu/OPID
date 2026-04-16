@@ -52,15 +52,7 @@ def summarize_group_size(group_size: list):
     Args:
         group_size : List[int]
     """
-    counts = Counter(group_size)
-    total = sum(counts.values())
-    max_size = max(counts)
-
-    summary = {}
-    for size in range(1, max_size + 1):
-        cnt = counts.get(size, 0)
-        prop = cnt / total if total > 0 else 0
-        summary[size] = (cnt, prop)
+    summary = build_group_size_summary(group_size)
 
     print("Summary of step-level group sizes:")
     print("Size | Count | Proportion")
@@ -68,7 +60,85 @@ def summarize_group_size(group_size: list):
     for size, (cnt, prop) in summary.items():
         if prop:
             print(f"{size:>4} | {cnt:>5} | {prop:>9.2%}")
-            
+
+
+def build_group_size_summary(group_size: Sequence[int]) -> Dict[int, Tuple[int, float]]:
+    """Return ``{group_size: (count, proportion_of_groups)}``."""
+    normalized_sizes = [int(size) for size in group_size if int(size) > 0]
+    if not normalized_sizes:
+        return {}
+
+    counts = Counter(normalized_sizes)
+    total = sum(counts.values())
+    max_size = max(counts)
+
+    summary: Dict[int, Tuple[int, float]] = {}
+    for size in range(1, max_size + 1):
+        cnt = counts.get(size, 0)
+        prop = cnt / total if total > 0 else 0.0
+        summary[size] = (cnt, prop)
+    return summary
+
+
+def compute_group_size_distribution_metrics(group_size: Sequence[int], prefix: str) -> Dict[str, float]:
+    """
+    Flatten a group-size distribution into scalar metrics that can be logged per
+    training step.
+    """
+    max_explicit_bucket = 10
+    normalized_sizes = [int(size) for size in group_size if int(size) > 0]
+    bucket_labels = [str(size) for size in range(1, max_explicit_bucket + 1)] + [f"gt_{max_explicit_bucket}"]
+
+    if not normalized_sizes:
+        metrics = {
+            f"{prefix}/num_groups": 0.0,
+            f"{prefix}/num_samples": 0.0,
+            f"{prefix}/mean": 0.0,
+            f"{prefix}/std": 0.0,
+            f"{prefix}/min": 0.0,
+            f"{prefix}/max": 0.0,
+        }
+        for label in bucket_labels:
+            metrics[f"{prefix}/size_{label}_group_count"] = 0.0
+            metrics[f"{prefix}/size_{label}_group_prop"] = 0.0
+            metrics[f"{prefix}/size_{label}_sample_prop"] = 0.0
+        return metrics
+
+    total_groups = float(len(normalized_sizes))
+    total_samples = float(sum(normalized_sizes))
+    metrics = {
+        f"{prefix}/num_groups": total_groups,
+        f"{prefix}/num_samples": total_samples,
+        f"{prefix}/mean": float(np.mean(normalized_sizes)),
+        f"{prefix}/std": float(np.std(normalized_sizes)),
+        f"{prefix}/min": float(np.min(normalized_sizes)),
+        f"{prefix}/max": float(np.max(normalized_sizes)),
+    }
+
+    bucket_group_counts = {label: 0 for label in bucket_labels}
+    bucket_sample_totals = {label: 0 for label in bucket_labels}
+    for size in normalized_sizes:
+        label = str(size) if size <= max_explicit_bucket else f"gt_{max_explicit_bucket}"
+        bucket_group_counts[label] += 1
+        bucket_sample_totals[label] += size
+
+    for label in bucket_labels:
+        cnt = float(bucket_group_counts[label])
+        metrics[f"{prefix}/size_{label}_group_count"] = cnt
+        metrics[f"{prefix}/size_{label}_group_prop"] = cnt / total_groups if total_groups > 0 else 0.0
+        metrics[f"{prefix}/size_{label}_sample_prop"] = float(bucket_sample_totals[label]) / total_samples if total_samples > 0 else 0.0
+    return metrics
+
+
+def compute_step_group_distribution_metrics(step_group_uids: Sequence, prefix: str) -> Dict[str, float]:
+    """Compute group-size metrics from the raw step-group assignments."""
+    if len(step_group_uids) == 0:
+        return compute_group_size_distribution_metrics([], prefix=prefix)
+
+    group_counts = Counter(step_group_uids.tolist() if isinstance(step_group_uids, np.ndarray) else list(step_group_uids))
+    return compute_group_size_distribution_metrics(group_counts.values(), prefix=prefix)
+
+
 def are_similar(a: str, b: str, threshold: float = 0.95) -> bool:
     """
     Check whether two text observations are similar enough.
@@ -346,7 +416,8 @@ def compute_copd_advantage_components(
     similarity_thresh: float = 0.95,
     normalize_teacher_adv: bool = False,
     clip_teacher_adv: Optional[float] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    metrics_prefix: str = "copd/state_group",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     """
     Compute the three token-level COPD advantage components and the weighted sum.
     """
@@ -366,6 +437,10 @@ def compute_copd_advantage_components(
         index=index,
         enable_similarity=enable_similarity,
         similarity_thresh=similarity_thresh,
+    )
+    step_group_metrics = compute_step_group_distribution_metrics(
+        step_group_uids=step_group_uids,
+        prefix=metrics_prefix,
     )
     step_advantages = step_norm_reward(
         step_rewards=step_rewards,
@@ -390,7 +465,7 @@ def compute_copd_advantage_components(
         + step_advantage_w * step_advantages
         + teacher_advantage_w * teacher_advantages
     )
-    return episode_advantages, step_advantages, teacher_advantages, scores
+    return episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics
 
 # ---------------------------------------------------------- #
 # ---------------- Core Functions of GiGPO ----------------- #
@@ -407,6 +482,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
                                    similarity_thresh: float = 0.95,
+                                   return_metrics: bool = False,
                                    ):
     """
     Compute the advantages for GiGPO (https://arxiv.org/abs/2505.10978).
@@ -418,12 +494,18 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     
     # Anchor state grouping (Eq. 6 in the paper).
     step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
+    step_group_metrics = compute_step_group_distribution_metrics(
+        step_group_uids=step_group_uids,
+        prefix="gigpo/state_group",
+    )
 
     # Compute step relative advantages (Eq. 7 in the paper).
     step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
 
     # Compute joint advantages (Eq. 8 in the paper).
     scores = episode_advantages + step_advantage_w * step_advantages
+    if return_metrics:
+        return scores, scores, step_group_metrics
     return scores, scores
 
 
@@ -454,7 +536,7 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
     where ``teacher_adv`` is derived from
         ``teacher_log_prob - old_log_prob``.
     """
-    episode_advantages, step_advantages, teacher_advantages, scores = compute_copd_advantage_components(
+    episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics = compute_copd_advantage_components(
         token_level_rewards=token_level_rewards,
         step_rewards=step_rewards,
         response_mask=response_mask,
@@ -472,6 +554,7 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
         similarity_thresh=similarity_thresh,
         normalize_teacher_adv=normalize_teacher_adv,
         clip_teacher_adv=clip_teacher_adv,
+        metrics_prefix="copd/state_group",
     )
     if return_metrics:
         component_metrics = summarize_copd_advantage_components(
@@ -483,6 +566,7 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
             teacher_advantage_w=teacher_advantage_w,
             epsilon=epsilon,
         )
+        component_metrics.update(step_group_metrics)
         return scores, scores, component_metrics
     return scores, scores
 

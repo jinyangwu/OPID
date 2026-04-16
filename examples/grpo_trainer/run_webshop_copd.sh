@@ -17,8 +17,10 @@ COPD_SELECTOR=llm
 COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
-COPD_TEACHER_ADV_W=0.1
-COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-0}
+COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-0.5}
+COPD_TEACHER_ADV_W_START=${COPD_TEACHER_ADV_W_START:-0.1}
+COPD_TEACHER_ADV_W_RAMP_STEPS=${COPD_TEACHER_ADV_W_RAMP_STEPS:-null}
+COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-null}
 COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH=${COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH:-True}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
@@ -31,7 +33,7 @@ SKILL_TOP_K=${SKILL_TOP_K:-15}
 SKILL_TASK_SPECIFIC_TOP_K=${SKILL_TASK_SPECIFIC_TOP_K:-5}
 
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_llm_exit-0_mem_0.1
+EXPERIMENT_NAME=copd_qwen2.5_1.5b_webshop_llm_0.1_0.5
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 history_length=2
@@ -80,6 +82,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
+    algorithm.copd.teacher_advantage_w_start=$COPD_TEACHER_ADV_W_START \
+    algorithm.copd.teacher_advantage_w_ramp_steps=$COPD_TEACHER_ADV_W_RAMP_STEPS \
     algorithm.copd.phase_switch_after_steps=$COPD_PHASE_SWITCH_AFTER_STEPS \
     algorithm.copd.use_with_memory_after_phase_switch=$COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH \
     algorithm.copd.mode=$COPD_MODE \

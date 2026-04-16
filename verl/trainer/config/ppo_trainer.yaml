@@ -255,6 +255,8 @@ algorithm:
   copd:
     step_advantage_w: 1.0
     teacher_advantage_w: 1.0
+    teacher_advantage_w_start: null # null -> keep teacher_advantage_w constant; otherwise linearly ramp from start to teacher_advantage_w
+    teacher_advantage_w_ramp_steps: null # null -> use trainer.total_training_steps for the ramp length
     phase_switch_after_steps: null
     use_with_memory_after_phase_switch: False
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
@@ -315,6 +317,23 @@ env:
   seed: 0
   max_steps: 50
   history_length: 2
+  guide_memory:
+    enable: False
+    episode_enable: True
+    step_enable: True
+    episode_top_k: 1
+    step_top_k: 1
+    promote_min_support: 2
+    merge_similarity_thresh: 0.9
+    state_similarity_thresh: 0.92
+    max_episode_guides_per_task: 8
+    max_step_guides_per_task: 24
+    max_task_chars: 256
+    max_state_chars: 384
+    max_episode_guide_chars: 256
+    max_step_guide_chars: 224
+    dump_dir: null # null -> ${trainer.default_local_dir}/guide_memory
+    dump_freq_steps: 1
   resources_per_worker: # resources for each env worker
     num_cpus: 0.1
     num_gpus: 0

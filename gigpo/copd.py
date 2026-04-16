@@ -325,6 +325,8 @@ class COPDEpisodeAnalyzer:
         steps: List[Dict[str, object]],
         candidate_step_indices: Optional[Sequence[int]] = None,
         select_steps: bool = False,
+        analysis_mode: str = "teacher_bootstrap",
+        episode_success: Optional[float] = None,
     ) -> Dict[str, object]:
         if self.backend == "openai":
             max_retries = 3
@@ -335,6 +337,8 @@ class COPDEpisodeAnalyzer:
                         steps=steps,
                         candidate_step_indices=candidate_step_indices,
                         select_steps=select_steps,
+                        analysis_mode=analysis_mode,
+                        episode_success=episode_success,
                     )
                 except Exception as exc:  # pragma: no cover - runtime fallback
                     last_error = exc
@@ -352,6 +356,8 @@ class COPDEpisodeAnalyzer:
                 steps=steps,
                 candidate_step_indices=candidate_step_indices,
                 select_steps=select_steps,
+                analysis_mode=analysis_mode,
+                episode_success=episode_success,
             )
             fallback["analysis_backend_requested"] = self.requested_backend
             fallback["analysis_backend_used"] = "heuristic"
@@ -361,6 +367,8 @@ class COPDEpisodeAnalyzer:
             steps=steps,
             candidate_step_indices=candidate_step_indices,
             select_steps=select_steps,
+            analysis_mode=analysis_mode,
+            episode_success=episode_success,
         )
 
     def _analyze_episode_with_heuristic(
@@ -368,10 +376,13 @@ class COPDEpisodeAnalyzer:
         steps: List[Dict[str, object]],
         candidate_step_indices: Optional[Sequence[int]] = None,
         select_steps: bool = False,
+        analysis_mode: str = "teacher_bootstrap",
+        episode_success: Optional[float] = None,
     ) -> Dict[str, object]:
         if not steps:
             return {
                 "episode_summary": "",
+                "overall_hint": "",
                 "selected_steps": [],
                 "step_hints": {},
                 "analysis_backend_requested": self.requested_backend,
@@ -424,8 +435,11 @@ class COPDEpisodeAnalyzer:
             )
             step_hints[step_idx] = hint
 
+        overall_hint = "Summarize the useful trajectory pattern and reuse it when the same task structure appears again."
+
         return {
             "episode_summary": episode_summary,
+            "overall_hint": overall_hint,
             "selected_steps": selected_steps,
             "step_hints": step_hints,
             "analysis_backend_requested": self.requested_backend,
@@ -440,12 +454,16 @@ class COPDEpisodeAnalyzer:
         steps: List[Dict[str, object]],
         candidate_step_indices: Optional[Sequence[int]] = None,
         select_steps: bool = False,
+        analysis_mode: str = "teacher_bootstrap",
+        episode_success: Optional[float] = None,
     ) -> Dict[str, object]:
         candidate_list = [] if candidate_step_indices is None else [int(idx) for idx in candidate_step_indices]
         prompt = self._build_episode_analysis_prompt(
             steps=steps,
             candidate_step_indices=candidate_list,
             select_steps=select_steps,
+            analysis_mode=analysis_mode,
+            episode_success=episode_success,
         )
         content = chat_completion_with_retry(
             client=self.client,
@@ -470,6 +488,8 @@ class COPDEpisodeAnalyzer:
         steps: List[Dict[str, object]],
         candidate_step_indices: Sequence[int],
         select_steps: bool,
+        analysis_mode: str = "teacher_bootstrap",
+        episode_success: Optional[float] = None,
     ) -> Dict[str, Any]:
         selection_instruction = (
             "Select at most "
@@ -477,20 +497,25 @@ class COPDEpisodeAnalyzer:
             if select_steps
             else "Provide one hindsight hint for every candidate step."
         )
+        summary_instruction = "Write a concise episode_summary."
+        overall_hint_instruction = "Write one reusable overall_hint distilled from the trajectory."
         prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
 
 Tasks:
-1. Write a concise episode_summary.
-2. {selection_instruction}
+1. {summary_instruction}
+2. {overall_hint_instruction}
+3. {selection_instruction}
 
 Important constraints:
 - Step indexing is 0-based: step 0 is the first step of the trajectory.
+- episode_success: {episode_success}
 
 Candidate step indices: {candidate_step_indices}
 
 Return format:
 {{
   "episode_summary": "string",
+  "overall_hint": "string",
   "selected_steps": [0, 2],
   "step_hints": {{
     "0": "hint for step 0",
@@ -536,6 +561,7 @@ Episode:
         selected_steps = [int(step_idx) for step_idx in parsed.get("selected_steps", step_hints.keys())]
         return {
             "episode_summary": str(parsed.get("episode_summary", "")),
+            "overall_hint": str(parsed.get("overall_hint", "")),
             "selected_steps": selected_steps,
             "step_hints": step_hints,
         }

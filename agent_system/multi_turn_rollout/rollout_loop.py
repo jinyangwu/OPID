@@ -137,9 +137,11 @@ class TrajectoryCollector:
         
         # Get observation components
         obs_texts = obs.get('text', None)
+        obs_base_texts = obs.get('text_base', None)
         obs_images = obs.get('image', None)
         obs_anchors = obs.get('anchor', None)
         obs_text = obs_texts[item] if obs_texts is not None else None
+        obs_text_base = obs_base_texts[item] if obs_base_texts is not None else obs_text
         obs_image = obs_images[item] if obs_images is not None else None
         obs_anchor = obs_anchors[item] if obs_anchors is not None else None
         is_multi_modal = obs_image is not None
@@ -251,6 +253,7 @@ class TrajectoryCollector:
             'raw_prompt_ids': raw_prompt_ids,
             'anchor_obs': _obs_anchor,
             'obs_text': obs_content,
+            'obs_text_base': "" if obs_text_base is None else str(obs_text_base),
             'index': item,
             'data_source': data_source
         })

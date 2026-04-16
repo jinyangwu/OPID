@@ -17,3 +17,4 @@ from .memory import SimpleMemory, SearchMemory
 from .retrieval_memory import RetrievalMemory
 from .skills_only_memory import SkillsOnlyMemory
 from .skill_updater import SkillUpdater
+from .guide_memory import COPDGuideMemory

@@ -250,7 +250,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             self.retrieved_memories = None
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
-        return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
+        return {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
@@ -266,7 +266,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
 
-        next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
+        next_observations = {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
@@ -578,7 +578,9 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         else:
             self.retrieved_memories = None
 
-        observations = {'text': self.build_text_obs(obs, infos, init=True),
+        full_text_obs = self.build_text_obs(obs, infos, init=True)
+        observations = {'text': full_text_obs,
+                        'text_base': full_text_obs,
                         'image': None,
                         'anchor': obs.copy()
                         }
@@ -595,8 +597,10 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = next_obs
 
+        full_text_obs = self.build_text_obs(next_obs, infos)
         next_observations = {
-            'text': self.build_text_obs(next_obs, infos),
+            'text': full_text_obs,
+            'text_base': full_text_obs,
             'image': None,
             'anchor': next_obs.copy()
         }
