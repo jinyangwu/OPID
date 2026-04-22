@@ -812,6 +812,189 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                     )
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
+    
+class SciWorldEnvironmentManager(EnvironmentManagerBase):
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+
+        if config.env.get('use_skills_only_memory', False):
+            from agent_system.memory import SkillsOnlyMemory
+            som_cfg = config.env.skills_only_memory
+            self.retrieval_memory = SkillsOnlyMemory(
+                skills_json_path=som_cfg.skills_json_path,
+                retrieval_mode=som_cfg.get('retrieval_mode', 'template'),
+                embedding_model_path=som_cfg.get('embedding_model_path', None),
+                task_specific_top_k=som_cfg.get('task_specific_top_k', None),
+            )
+            self.retrieved_memories = None
+            print(f"[SciWorldEnvironmentManager] Skills-only memory enabled "
+                  f"(mode={som_cfg.get('retrieval_mode', 'template')})")
+        elif config.env.get('use_retrieval_memory', False):
+            from agent_system.memory import RetrievalMemory
+            self.retrieval_memory = RetrievalMemory(
+                memory_json_path=config.env.retrieval_memory.json_path,
+                embedding_model_name=config.env.retrieval_memory.get('embedding_model', 'Qwen/Qwen3-Embedding-0.6B'),
+                device=config.env.retrieval_memory.get('device', 'cuda'),
+                skills_json_path=config.env.retrieval_memory.get('skills_json_path', None)
+            )
+            self.retrieved_memories = None
+            print(f"[SciWorldEnvironmentManager] Retrieval memory enabled")
+        else:
+            self.retrieval_memory = None
+            self.retrieved_memories = None
+
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs=None):
+        text_obs, infos = self.envs.reset()
+
+        self.memory.reset(batch_size=len(text_obs))
+        self.tasks = self.extract_task_descriptions(infos)
+        self.pre_text_obs = text_obs
+
+        if self.retrieval_memory is not None and self._copd_use_with_memory:
+            self.retrieved_memories = []
+
+            if self.config.env.get('use_skills_only_memory', False):
+                mem_config = self.config.env.skills_only_memory
+            else:
+                mem_config = self.config.env.retrieval_memory
+
+            for task in self.tasks:
+                memories = self.retrieval_memory.retrieve(
+                    task_description=task,
+                    top_k=mem_config.get('top_k', 10),
+                    similarity_threshold=mem_config.get('similarity_threshold', 0.7),
+                    max_tokens=mem_config.get('max_tokens', 2000),
+                    include_examples=mem_config.get('include_examples', False)
+                )
+                self.retrieved_memories.append(memories)
+        else:
+            self.retrieved_memories = None
+
+        full_text_obs = self.build_text_obs(
+            text_obs,
+            self.envs.get_admissible_commands,
+            init=True
+        )
+        return {
+            'text': full_text_obs,
+            'text_base': full_text_obs,
+            'image': None,
+            'anchor': text_obs,
+        }, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions, self.envs.get_possible_actions)
+        text_obs, rewards, dones, infos = self.envs.step(actions)
+
+        self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
+        self.pre_text_obs = text_obs
+
+        full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
+
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+            info['score'] = info.get('score', -1)
+
+        next_observations = {
+            'text': full_text_obs,
+            'text_base': full_text_obs,
+            'image': None,
+            'anchor': text_obs,
+        }
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+
+        return next_observations, rewards, dones, infos
+
+    def extract_task_descriptions(self, infos: List[dict]) -> List[str]:
+        tasks = []
+        for info in infos:
+            tasks.append(info.get('task_description', "Unknown task"))
+        return tasks
+
+    def format_admissible_actions(self, admissible_actions: Any) -> str:
+        if admissible_actions is None:
+            return ""
+        if isinstance(admissible_actions, str):
+            return admissible_actions
+        if isinstance(admissible_actions, (list, tuple)):
+            return "\n".join(f"'{action}'" for action in admissible_actions)
+        return str(admissible_actions)
+
+    def build_text_obs(
+        self,
+        text_obs: List[str],
+        admissible_actions: List[Any],
+        init: bool = False
+    ) -> List[str]:
+        postprocess_text_obs = []
+        memory_contexts = [""] * len(text_obs)
+        valid_lens = [0] * len(text_obs)
+
+        if not init and self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                self.config.env.history_length,
+                obs_key="text_obs",
+                action_key="action"
+            )
+
+        use_retrieval = (
+            self.retrieval_memory is not None
+            and self.retrieved_memories is not None
+            and self._copd_use_with_memory
+        )
+
+        for i in range(len(text_obs)):
+            formatted_actions = self.format_admissible_actions(admissible_actions[i])
+            step_count = 0 if init else len(self.memory[i])
+            current_step = 1 if init else len(self.memory[i]) + 1
+
+            if use_retrieval:
+                memory_context = self.retrieval_memory.format_for_prompt(
+                    self.retrieved_memories[i]
+                )
+                obs = SCIWORLD_TEMPLATE_WITH_MEMORY.format(
+                    task_description=self.tasks[i],
+                    retrieved_memories=memory_context,
+                    step_count=step_count,
+                    history_length=valid_lens[i],
+                    action_history=memory_contexts[i],
+                    current_step=current_step,
+                    current_observation=text_obs[i],
+                    admissible_actions=formatted_actions,
+                )
+            elif init or self.config.env.history_length <= 0:
+                obs = SCIWORLD_TEMPLATE_NO_HIS.format(
+                    task_description=self.tasks[i],
+                    current_observation=text_obs[i],
+                    admissible_actions=formatted_actions,
+                )
+            else:
+                obs = SCIWORLD_TEMPLATE.format(
+                    task_description=self.tasks[i],
+                    step_count=step_count,
+                    history_length=valid_lens[i],
+                    action_history=memory_contexts[i],
+                    current_step=current_step,
+                    current_observation=text_obs[i],
+                    admissible_actions=formatted_actions,
+                )
+
+            postprocess_text_obs.append(obs)
+
+        return postprocess_text_obs
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
+        for i in reversed(range(len(total_batch_list[batch_idx]))):
+            batch_item = total_batch_list[batch_idx][i]
+            if batch_item['active_masks']:
+                info = total_infos[batch_idx][i]
+                won_value = float(info['won'])
+                success['success_rate'].append(won_value)
+                return
+
 
 def make_envs(config):
     """
@@ -907,6 +1090,57 @@ def make_envs(config):
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+    elif "sciworld" in config.env.env_name.lower():
+        from agent_system.environments.env_package.sciworld import build_sciworld_envs, sciworld_projection
+        import json
+        generalization_level = config.env.sciworld.get('generalization_level', 0)
+
+        if generalization_level == 2:
+            variation_path = 'agent_system/environments/env_package/sciworld/variations_idx/L2_idx.json'
+        elif generalization_level == 1:
+            variation_path = 'agent_system/environments/env_package/sciworld/variations_idx/L1_idx.json'
+        elif generalization_level == 0:
+            variation_path = 'agent_system/environments/env_package/sciworld/variations_idx/L0_idx.json'
+
+        with open(variation_path, 'r') as f:
+            variations_idx = json.load(f)
+
+        simplifications_preset = config.env.sciworld.get('simplifications_preset', "easy")
+        env_step_limit = config.env.sciworld.get('env_step_limit', 100)
+        jar_path = config.env.sciworld.get('jar_path', None)
+
+        _envs = build_sciworld_envs(
+            seed=config.env.seed, 
+            env_num=config.data.train_batch_size, 
+            group_n=group_n, 
+            simplifications_preset=simplifications_preset,
+            env_step_limit=env_step_limit,
+            jar_path=jar_path,
+            variations_idx=variations_idx['train']
+        )
+
+        _val_envs = build_sciworld_envs(
+            seed=config.env.seed + 1000, 
+            env_num=config.data.val_batch_size, 
+            group_n=1, 
+            simplifications_preset=simplifications_preset,
+            env_step_limit=env_step_limit,
+            jar_path=jar_path,
+            variations_idx=variations_idx['test']
+        )
+
+        # Create projection function
+        projection_f = partial(sciworld_projection)
+
+        # Create environment managers
+        envs = SciWorldEnvironmentManager(_envs, projection_f, config)
+        val_envs = SciWorldEnvironmentManager(_val_envs, projection_f, config)
+
+        # Give some time for environments to initialize
+        import time
+        time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1)
+
         return envs, val_envs
     else:
         print("Environment not supported")

@@ -83,7 +83,7 @@ def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 256 * 
     return image
 
 
-def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
+def adjust_batch(config, data: DataProto, mode="copy", track_source_indices: bool = False) -> DataProto:
     world_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
     size_divisor_rollout = config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu * world_size
     if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
@@ -100,6 +100,13 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
     bs = len(data)
     remainder = bs % size_divisor
     if remainder == 0:
+        if track_source_indices:
+            base_source_indices = data.non_tensor_batch.get("_batch_source_idx")
+            if base_source_indices is None:
+                base_source_indices = np.arange(bs, dtype=np.int64)
+            else:
+                base_source_indices = np.asarray(base_source_indices, dtype=np.int64)
+            data.non_tensor_batch["_batch_source_idx"] = base_source_indices
         return data
     
     if mode == "delete":
@@ -126,6 +133,22 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
         adjusted_batch = DataProto.concat([data, dup_proto])
     else:
         raise ValueError(f"Unsupported mode: {mode}")
+
+    if track_source_indices:
+        base_source_indices = data.non_tensor_batch.get("_batch_source_idx")
+        if base_source_indices is None:
+            base_source_indices = np.arange(bs, dtype=np.int64)
+        else:
+            base_source_indices = np.asarray(base_source_indices, dtype=np.int64)
+
+        if mode == "copy":
+            adjusted_source_indices = np.concatenate(
+                [base_source_indices, base_source_indices[dup_indices]]
+            ).astype(np.int64, copy=False)
+        else:
+            adjusted_source_indices = base_source_indices[keep_mask]
+
+        adjusted_batch.non_tensor_batch["_batch_source_idx"] = adjusted_source_indices
 
     return adjusted_batch
 
@@ -182,4 +205,3 @@ def filter_group_data(batch_list : List[Dict],
     tool_callings = tool_callings[keep_indices]
 
     return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
-

@@ -487,6 +487,7 @@ class RayPPOTrainer:
         self._copd_teacher_adv_last_weight = None
         self._copd_with_memory_last_enabled_state = None
         self._copd_with_memory_missing_skills_warned = False
+        self._copd_teacher_signal_executor = None
         self.traj_collector = traj_collector
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -625,6 +626,76 @@ class RayPPOTrainer:
         metrics["copd/critical_step_ratio"] = 0.0
         metrics["copd/teacher_batch_size"] = 0.0
         metrics["copd/teacher_available"] = 0.0
+        return batch
+
+    def _lazy_init_copd_teacher_signal_executor(self):
+        if self._copd_teacher_signal_executor is None:
+            self._copd_teacher_signal_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="copd-teacher-signal",
+            )
+        return self._copd_teacher_signal_executor
+
+    def _build_copd_teacher_signal_snapshot(self, batch: DataProto) -> DataProto:
+        tensors = {
+            "responses": batch.batch["responses"].clone(),
+            "attention_mask": batch.batch["attention_mask"].clone(),
+        }
+        if "step_rewards" in batch.batch.keys():
+            tensors["step_rewards"] = batch.batch["step_rewards"].clone()
+
+        non_tensor_keys = [
+            "obs_text",
+            "obs_text_base",
+            "anchor_obs",
+            "traj_uid",
+            "uid",
+            "data_source",
+            "episode_success",
+            "episode_rewards",
+            "multi_modal_inputs",
+        ]
+        non_tensors = {}
+        for key in non_tensor_keys:
+            if key in batch.non_tensor_batch:
+                non_tensors[key] = deepcopy(batch.non_tensor_batch[key])
+
+        return DataProto.from_dict(
+            tensors=tensors,
+            non_tensors=non_tensors,
+            meta_info=deepcopy(batch.meta_info),
+        )
+
+    def _prepare_copd_teacher_signals_async_task(self, batch: DataProto, teacher_enabled: bool):
+        local_metrics: Dict[str, float] = {}
+        output_batch = self._prepare_copd_teacher_signals(
+            batch=batch,
+            metrics=local_metrics,
+            teacher_enabled=teacher_enabled,
+        )
+        return output_batch, local_metrics
+
+    def _merge_async_copd_teacher_signals(
+        self,
+        batch: DataProto,
+        teacher_signal_batch: DataProto,
+    ) -> DataProto:
+        source_indices = batch.non_tensor_batch.get("_batch_source_idx")
+        teacher_log_prob = teacher_signal_batch.batch["teacher_log_prob"]
+        critical_step_mask = teacher_signal_batch.batch["critical_step_mask"]
+
+        if source_indices is not None:
+            gather_idx = torch.as_tensor(
+                np.asarray(source_indices, dtype=np.int64),
+                dtype=torch.long,
+                device=teacher_log_prob.device,
+            )
+            teacher_log_prob = teacher_log_prob.index_select(0, gather_idx)
+            critical_step_mask = critical_step_mask.index_select(0, gather_idx)
+
+        batch.batch["teacher_log_prob"] = teacher_log_prob
+        batch.batch["critical_step_mask"] = critical_step_mask
+        batch.non_tensor_batch.pop("_batch_source_idx", None)
         return batch
 
     def _validate_config(self):
@@ -2036,6 +2107,7 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
+                    copd_teacher_future = None
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
                         copd_teacher_adv_enabled = self._is_copd_teacher_adv_enabled()
                         copd_with_memory_enabled = self._should_copd_use_with_memory_rollout()
@@ -2089,13 +2161,17 @@ class RayPPOTrainer:
                         metrics["copd/teacher_enabled"] = 1.0 if copd_teacher_adv_enabled else 0.0
                         metrics["copd/teacher_disabled_by_schedule"] = 0.0 if copd_teacher_adv_enabled else 1.0
                         metrics["copd/with_memory_enabled"] = 1.0 if copd_with_memory_enabled else 0.0
-                        batch = self._prepare_copd_teacher_signals(
-                            batch=batch,
-                            metrics=metrics,
-                            teacher_enabled=copd_teacher_adv_enabled,
+                        copd_teacher_future = self._lazy_init_copd_teacher_signal_executor().submit(
+                            self._prepare_copd_teacher_signals_async_task,
+                            self._build_copd_teacher_signal_snapshot(batch),
+                            copd_teacher_adv_enabled,
                         )
                     
-                    batch = adjust_batch(self.config, batch)
+                    batch = adjust_batch(
+                        self.config,
+                        batch,
+                        track_source_indices=self.config.algorithm.adv_estimator == AdvantageEstimator.COPD,
+                    )
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -2168,6 +2244,23 @@ class RayPPOTrainer:
                         with _timer("values", timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
+                        with _timer("copd_teacher", timing_raw):
+                            try:
+                                teacher_signal_batch, teacher_signal_metrics = copd_teacher_future.result()
+                                metrics.update(teacher_signal_metrics)
+                                batch = self._merge_async_copd_teacher_signals(
+                                    batch=batch,
+                                    teacher_signal_batch=teacher_signal_batch,
+                                )
+                            except Exception as exc:
+                                module_logger.warning(
+                                    "Asynchronous COPD teacher signal preparation failed; falling back to zero teacher signals for this batch: %s",
+                                    exc,
+                                )
+                                batch.non_tensor_batch.pop("_batch_source_idx", None)
+                                batch = self._set_zero_copd_teacher_signals(batch=batch, metrics=metrics)
 
                     with _timer("adv", timing_raw):
                         # we combine with rule-based rm

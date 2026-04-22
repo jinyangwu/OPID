@@ -6,7 +6,7 @@ ulimit -u 65536
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-1.5B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct}
 TRAIN_DATA_SIZE=16
 VAL_DATA_SIZE=128
 GROUP_SIZE=8
@@ -18,12 +18,12 @@ COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_STEP_ADV_W=1
 COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-0.1}
-COPD_TEACHER_ADV_W_START=${COPD_TEACHER_ADV_W_START:-0.1}
-COPD_TEACHER_ADV_W_RAMP_STEPS=${COPD_TEACHER_ADV_W_RAMP_STEPS:-null}
+COPD_TEACHER_ADV_W_START=${COPD_TEACHER_ADV_W_START:-0.0}
+COPD_TEACHER_ADV_W_RAMP_STEPS=${COPD_TEACHER_ADV_W_RAMP_STEPS:-5}
 COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-null}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
-COPD_STATS_TOPK_PER_TRAJ=3
+COPD_STATS_TOPK_PER_TRAJ=5
 COPD_SIMILARITY_THRESH=0.95
 
 GUIDE_MEMORY_ENABLE=${GUIDE_MEMORY_ENABLE:-True}
@@ -38,7 +38,7 @@ GUIDE_MAX_EPISODE_GUIDES_PER_TASK=${GUIDE_MAX_EPISODE_GUIDES_PER_TASK:-8}
 GUIDE_MAX_STEP_GUIDES_PER_TASK=${GUIDE_MAX_STEP_GUIDES_PER_TASK:-24}
 
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd_qwen2.5_1.5b_webshop_stats_guide_classic}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd_qwen2.5_7b_webshop_stats_guide}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 history_length=2
@@ -71,7 +71,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
