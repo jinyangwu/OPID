@@ -1,10 +1,12 @@
 set -x
 
+# Runtime backend.
 ENGINE=vllm
 
 ulimit -u 65536
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
+# Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
 MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-1.5B-Instruct}
 TRAIN_DATA_SIZE=16
@@ -12,23 +14,32 @@ VAL_DATA_SIZE=128
 GROUP_SIZE=8
 NUM_CPUS_PER_ENV_WORKER=0.1
 
+# COPD advantage, teacher/OPD signal schedule, and phase control.
 COPD_MODE=mean_norm
-COPD_SELECTOR=stats
+COPD_STEP_ADV_W=0.0
+COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-0.001}
+COPD_OPD_START_AFTER_STEPS=${COPD_OPD_START_AFTER_STEPS:-10}
+COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-null}
+
+# COPD episode filtering and teacher prompt construction.
+COPD_FAILED_ONLY=${COPD_FAILED_ONLY:-False}
+COPD_FAILED_ONLY_AFTER_STEPS=${COPD_FAILED_ONLY_AFTER_STEPS:-null}
+COPD_FAILURE_SUCCESS_THRESHOLD=${COPD_FAILURE_SUCCESS_THRESHOLD:-1.0}
+COPD_ENHANCE_STEP_HINT_ONLY=${COPD_ENHANCE_STEP_HINT_ONLY:-True}
+
+# COPD critical-step selection and analysis.
+COPD_SELECTOR=${COPD_SELECTOR:-llm}
 COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
-COPD_STEP_ADV_W=1
-COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-0.1}
-COPD_TEACHER_ADV_W_START=${COPD_TEACHER_ADV_W_START:-0.0}
-COPD_TEACHER_ADV_W_RAMP_STEPS=${COPD_TEACHER_ADV_W_RAMP_STEPS:-5}
-COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-null}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
-COPD_STATS_TOPK_PER_TRAJ=6
+COPD_STATS_TOPK_PER_TRAJ=5
 COPD_SIMILARITY_THRESH=0.95
 
+# Guide memory retrieval and storage behavior.
 GUIDE_MEMORY_ENABLE=${GUIDE_MEMORY_ENABLE:-True}
-GUIDE_EPISODE_ENABLE=${GUIDE_EPISODE_ENABLE:-True}
-GUIDE_STEP_ENABLE=${GUIDE_STEP_ENABLE:-True}
+GUIDE_EPISODE_ENABLE=${GUIDE_EPISODE_ENABLE:-False}
+GUIDE_STEP_ENABLE=${GUIDE_STEP_ENABLE:-False}
 GUIDE_EPISODE_TOP_K=${GUIDE_EPISODE_TOP_K:-1}
 GUIDE_STEP_TOP_K=${GUIDE_STEP_TOP_K:-1}
 GUIDE_PROMOTE_MIN_SUPPORT=${GUIDE_PROMOTE_MIN_SUPPORT:-1}
@@ -37,10 +48,12 @@ GUIDE_STATE_SIMILARITY_THRESH=${GUIDE_STATE_SIMILARITY_THRESH:-0.95}
 GUIDE_MAX_EPISODE_GUIDES_PER_TASK=${GUIDE_MAX_EPISODE_GUIDES_PER_TASK:-8}
 GUIDE_MAX_STEP_GUIDES_PER_TASK=${GUIDE_MAX_STEP_GUIDES_PER_TASK:-24}
 
+# Experiment naming and output location.
 PROJECT_NAME=agentic_alfworld
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd_qwen2.5_1.5b_alfworld_stats_guide_classic}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_alfworld_llm-5_no-guide_opd-adv-0.001_start-10_step-only}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
+# Prompt observation history.
 history_length=5
 
 python3 -m examples.data_preprocess.prepare \
@@ -67,6 +80,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.opd_loss_coef=0.0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
@@ -87,10 +101,13 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
-    algorithm.copd.teacher_advantage_w_start=$COPD_TEACHER_ADV_W_START \
-    algorithm.copd.teacher_advantage_w_ramp_steps=$COPD_TEACHER_ADV_W_RAMP_STEPS \
+    algorithm.copd.opd_start_after_steps=$COPD_OPD_START_AFTER_STEPS \
     algorithm.copd.phase_switch_after_steps=$COPD_PHASE_SWITCH_AFTER_STEPS \
     algorithm.copd.use_with_memory_after_phase_switch=False \
+    algorithm.copd.failed_only=$COPD_FAILED_ONLY \
+    algorithm.copd.failed_only_after_steps=$COPD_FAILED_ONLY_AFTER_STEPS \
+    algorithm.copd.failure_success_threshold=$COPD_FAILURE_SUCCESS_THRESHOLD \
+    algorithm.copd.enhance_step_hint_only=$COPD_ENHANCE_STEP_HINT_ONLY \
     algorithm.copd.mode=$COPD_MODE \
     algorithm.copd.selector=$COPD_SELECTOR \
     algorithm.copd.enable_similarity=False \
@@ -124,9 +141,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=50 \
     trainer.test_freq=5 \
     trainer.total_epochs=160 \
     trainer.val_before_train=False \

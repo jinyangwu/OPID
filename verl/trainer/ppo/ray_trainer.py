@@ -29,7 +29,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Dict, Optional, Type
+from typing import Dict, List, Optional, Type
 
 import numpy as np
 import ray
@@ -65,7 +65,7 @@ from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 from gigpo import copd as core_copd
 
-from agent_system.memory.guide_memory import COPDGuideMemory
+from agent_system.memory.guide_memory import COPDGuideMemory, build_augmented_observation_text
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -486,6 +486,7 @@ class RayPPOTrainer:
         self._copd_teacher_adv_last_enabled_state = None
         self._copd_teacher_adv_last_weight = None
         self._copd_with_memory_last_enabled_state = None
+        self._copd_failed_only_last_enabled_state = None
         self._copd_with_memory_missing_skills_warned = False
         self._copd_teacher_signal_executor = None
         self.traj_collector = traj_collector
@@ -537,6 +538,40 @@ class RayPPOTrainer:
             return None
         return int(phase_switch_after_steps)
 
+    def _get_copd_opd_start_after_steps(self) -> Optional[int]:
+        start_after_steps = OmegaConf.select(self.config, "algorithm.copd.opd_start_after_steps")
+        if start_after_steps is None:
+            # Backward compatibility for older launch commands.
+            start_after_steps = OmegaConf.select(self.config, "algorithm.copd.teacher_advantage_start_after_steps")
+        if start_after_steps is None:
+            return None
+        return int(start_after_steps)
+
+    def _get_copd_failed_only_after_steps(self) -> Optional[int]:
+        failed_only_after_steps = OmegaConf.select(self.config, "algorithm.copd.failed_only_after_steps")
+        if failed_only_after_steps is None:
+            return None
+        return int(failed_only_after_steps)
+
+    def _should_copd_analyze_failed_only(self) -> bool:
+        failed_only_after_steps = self._get_copd_failed_only_after_steps()
+        if failed_only_after_steps is None:
+            enabled = bool(OmegaConf.select(self.config, "algorithm.copd.failed_only"))
+            schedule_text = "static config"
+        else:
+            enabled = self.global_steps > failed_only_after_steps
+            schedule_text = f"after step {failed_only_after_steps}"
+
+        if self._copd_failed_only_last_enabled_state != enabled:
+            module_logger.info(
+                "COPD failed-only episode analysis is %s at global_step=%s (%s).",
+                "enabled" if enabled else "disabled",
+                self.global_steps,
+                schedule_text,
+            )
+            self._copd_failed_only_last_enabled_state = enabled
+        return enabled
+
     def _get_copd_teacher_advantage_weight(self, teacher_enabled: bool) -> float:
         if not teacher_enabled:
             return 0.0
@@ -548,15 +583,17 @@ class RayPPOTrainer:
         else:
             start_weight = float(start_weight)
             ramp_steps = OmegaConf.select(self.config, "algorithm.copd.teacher_advantage_w_ramp_steps")
+            start_after_steps = self._get_copd_opd_start_after_steps() or 0
             if ramp_steps is None:
-                ramp_steps = int(self.total_training_steps)
+                ramp_steps = max(int(self.total_training_steps) - start_after_steps, 1)
             else:
                 ramp_steps = int(ramp_steps)
 
             if ramp_steps <= 1:
                 weight = target_weight
             else:
-                progress = min(max(self.global_steps - 1, 0), ramp_steps - 1) / float(ramp_steps - 1)
+                teacher_enabled_step = self.global_steps - start_after_steps
+                progress = min(max(teacher_enabled_step - 1, 0), ramp_steps - 1) / float(ramp_steps - 1)
                 weight = start_weight + (target_weight - start_weight) * progress
 
         if self._copd_teacher_adv_last_weight is None or abs(self._copd_teacher_adv_last_weight - weight) > 1e-8:
@@ -594,17 +631,36 @@ class RayPPOTrainer:
         env_manager.set_copd_use_with_memory(use_with_memory)
 
     def _is_copd_teacher_adv_enabled(self) -> bool:
+        start_after_steps = self._get_copd_opd_start_after_steps()
         phase_switch_after_steps = self._get_copd_phase_switch_after_steps()
-        if phase_switch_after_steps is None:
-            return True
 
-        enabled = self.global_steps <= phase_switch_after_steps
+        enabled = True
+        disabled_reason = None
+        if start_after_steps is not None and self.global_steps <= start_after_steps:
+            enabled = False
+            disabled_reason = "before_start"
+        elif phase_switch_after_steps is not None and self.global_steps > phase_switch_after_steps:
+            enabled = False
+            disabled_reason = "after_phase_switch"
+
         if self._copd_teacher_adv_last_enabled_state != enabled:
             if enabled:
+                schedule_parts = []
+                if start_after_steps is not None:
+                    schedule_parts.append(f"after step {start_after_steps}")
+                if phase_switch_after_steps is not None:
+                    schedule_parts.append(f"until step {phase_switch_after_steps}")
+                schedule_text = f" ({', '.join(schedule_parts)})" if schedule_parts else ""
                 module_logger.info(
-                    "COPD teacher advantage is enabled at global_step=%s and will be disabled after step %s.",
+                    "COPD teacher advantage is enabled at global_step=%s%s.",
                     self.global_steps,
-                    phase_switch_after_steps,
+                    schedule_text,
+                )
+            elif disabled_reason == "before_start":
+                module_logger.info(
+                    "COPD teacher advantage is disabled at global_step=%s until after step %s.",
+                    self.global_steps,
+                    start_after_steps,
                 )
             else:
                 module_logger.info(
@@ -619,6 +675,11 @@ class RayPPOTrainer:
         batch_size = len(batch)
         batch.batch["teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
         batch.batch["critical_step_mask"] = torch.zeros(
+            batch_size,
+            dtype=torch.bool,
+            device=batch.batch["responses"].device,
+        )
+        batch.batch["teacher_signal_mask"] = torch.zeros(
             batch_size,
             dtype=torch.bool,
             device=batch.batch["responses"].device,
@@ -683,6 +744,10 @@ class RayPPOTrainer:
         source_indices = batch.non_tensor_batch.get("_batch_source_idx")
         teacher_log_prob = teacher_signal_batch.batch["teacher_log_prob"]
         critical_step_mask = teacher_signal_batch.batch["critical_step_mask"]
+        if "teacher_signal_mask" in teacher_signal_batch.batch.keys():
+            teacher_signal_mask = teacher_signal_batch.batch["teacher_signal_mask"]
+        else:
+            teacher_signal_mask = critical_step_mask
 
         if source_indices is not None:
             gather_idx = torch.as_tensor(
@@ -692,9 +757,11 @@ class RayPPOTrainer:
             )
             teacher_log_prob = teacher_log_prob.index_select(0, gather_idx)
             critical_step_mask = critical_step_mask.index_select(0, gather_idx)
+            teacher_signal_mask = teacher_signal_mask.index_select(0, gather_idx)
 
         batch.batch["teacher_log_prob"] = teacher_log_prob
         batch.batch["critical_step_mask"] = critical_step_mask
+        batch.batch["teacher_signal_mask"] = teacher_signal_mask
         batch.non_tensor_batch.pop("_batch_source_idx", None)
         return batch
 
@@ -703,8 +770,31 @@ class RayPPOTrainer:
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         phase_switch_after_steps = OmegaConf.select(config, "algorithm.copd.phase_switch_after_steps")
+        opd_start_after_steps = OmegaConf.select(config, "algorithm.copd.opd_start_after_steps")
+        legacy_teacher_advantage_start_after_steps = OmegaConf.select(
+            config,
+            "algorithm.copd.teacher_advantage_start_after_steps",
+        )
+        if opd_start_after_steps is None:
+            opd_start_after_steps = legacy_teacher_advantage_start_after_steps
+        elif legacy_teacher_advantage_start_after_steps is not None and int(legacy_teacher_advantage_start_after_steps) != int(opd_start_after_steps):
+            module_logger.warning(
+                "Both algorithm.copd.opd_start_after_steps=%s and legacy algorithm.copd.teacher_advantage_start_after_steps=%s are set; using opd_start_after_steps.",
+                opd_start_after_steps,
+                legacy_teacher_advantage_start_after_steps,
+            )
+        failed_only_after_steps = OmegaConf.select(config, "algorithm.copd.failed_only_after_steps")
         if phase_switch_after_steps is not None and int(phase_switch_after_steps) < 0:
             raise ValueError("algorithm.copd.phase_switch_after_steps must be null or a non-negative integer.")
+        if opd_start_after_steps is not None and int(opd_start_after_steps) < 0:
+            raise ValueError("algorithm.copd.opd_start_after_steps must be null or a non-negative integer.")
+        if failed_only_after_steps is not None and int(failed_only_after_steps) < 0:
+            raise ValueError("algorithm.copd.failed_only_after_steps must be null or a non-negative integer.")
+        if failed_only_after_steps is not None and bool(OmegaConf.select(config, "algorithm.copd.failed_only")):
+            module_logger.warning(
+                "algorithm.copd.failed_only_after_steps=%s is set, so scheduled all-then-failed analysis overrides algorithm.copd.failed_only=True until after that step.",
+                failed_only_after_steps,
+            )
         if OmegaConf.select(config, "algorithm.copd.use_with_memory_after_phase_switch") and phase_switch_after_steps is None:
             module_logger.warning(
                 "algorithm.copd.use_with_memory_after_phase_switch is enabled but algorithm.copd.phase_switch_after_steps is null, so the WITH_MEMORY rollout phase will never be reached."
@@ -723,14 +813,25 @@ class RayPPOTrainer:
         if teacher_advantage_w_ramp_steps is not None and int(teacher_advantage_w_ramp_steps) <= 0:
             raise ValueError("algorithm.copd.teacher_advantage_w_ramp_steps must be null or a positive integer.")
         if teacher_advantage_w_start is not None and phase_switch_after_steps is not None:
-            if int(phase_switch_after_steps) == 0:
+            teacher_start_after_steps = int(opd_start_after_steps or 0)
+            teacher_enabled_steps_before_phase_switch = int(phase_switch_after_steps) - teacher_start_after_steps
+            if teacher_enabled_steps_before_phase_switch <= 0:
                 module_logger.warning(
-                    "algorithm.copd.teacher_advantage_w_start is set, but algorithm.copd.phase_switch_after_steps=0 disables teacher advantage before the first training step. The teacher weight ramp will therefore never take effect."
+                    "algorithm.copd.teacher_advantage_w_start is set, but teacher advantage is never enabled because opd_start_after_steps=%s and phase_switch_after_steps=%s. The teacher weight ramp will therefore never take effect.",
+                    teacher_start_after_steps,
+                    phase_switch_after_steps,
                 )
-            elif teacher_advantage_w_ramp_steps is not None and int(phase_switch_after_steps) < int(teacher_advantage_w_ramp_steps):
+            elif teacher_advantage_w_ramp_steps is not None and teacher_enabled_steps_before_phase_switch < int(teacher_advantage_w_ramp_steps):
                 module_logger.warning(
-                    "algorithm.copd.teacher_advantage_w_ramp_steps=%s is longer than the teacher-enabled phase (phase_switch_after_steps=%s). The teacher weight ramp will stop early at the phase switch.",
+                    "algorithm.copd.teacher_advantage_w_ramp_steps=%s is longer than the teacher-enabled phase (%s steps). The teacher weight ramp will stop early at the phase switch.",
                     teacher_advantage_w_ramp_steps,
+                    teacher_enabled_steps_before_phase_switch,
+                )
+        elif opd_start_after_steps is not None and phase_switch_after_steps is not None:
+            if int(opd_start_after_steps) >= int(phase_switch_after_steps):
+                module_logger.warning(
+                    "algorithm.copd.opd_start_after_steps=%s is not earlier than phase_switch_after_steps=%s, so teacher advantage will never be enabled.",
+                    opd_start_after_steps,
                     phase_switch_after_steps,
                 )
 
@@ -972,7 +1073,7 @@ class RayPPOTrainer:
                         self.config.algorithm.copd.analysis_backend,
                     ),
                     "analysis_error": analysis.get("analysis_error"),
-                    "select_steps": bool(task.get("select_steps", False)),
+                    "episode_success": task.get("episode_success"),
                     "candidate_step_indices": task.get("candidate_step_indices"),
                     "num_steps": len(task.get("steps", [])),
                     "step_indices": [
@@ -980,11 +1081,9 @@ class RayPPOTrainer:
                         for step in task.get("steps", [])
                     ],
                     "episode_summary": str(analysis.get("episode_summary", "")),
-                    "overall_hint": str(analysis.get("overall_hint", "")),
-                    "selected_steps": [
-                        int(step_idx)
-                        for step_idx in analysis.get("selected_steps", [])
-                    ],
+                    "episode_hint": str(
+                        analysis.get("episode_hint") or analysis.get("overall_hint", "")
+                    ),
                     "step_hints": {
                         str(step_idx): str(hint)
                         for step_idx, hint in analysis.get("step_hints", {}).items()
@@ -995,6 +1094,39 @@ class RayPPOTrainer:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         module_logger.info("Dumped COPD analysis results to %s", filename)
+
+    def _get_copd_augmented_observation_dump_dir(self) -> Optional[str]:
+        save_augmented_observations = OmegaConf.select(
+            self.config,
+            "algorithm.copd.save_augmented_observations",
+        )
+        if not save_augmented_observations:
+            return None
+
+        dump_dir = OmegaConf.select(
+            self.config,
+            "algorithm.copd.augmented_observation_dump_dir",
+        )
+        if dump_dir:
+            return dump_dir
+
+        return os.path.join(
+            self.config.trainer.default_local_dir,
+            "copd_augmented_observations",
+        )
+
+    def _dump_copd_augmented_observations(self, entries: List[Dict[str, object]]) -> None:
+        dump_dir = self._get_copd_augmented_observation_dump_dir()
+        if dump_dir is None or not entries:
+            return
+
+        os.makedirs(dump_dir, exist_ok=True)
+        filename = os.path.join(dump_dir, f"step_{self.global_steps:08d}.jsonl")
+        with open(filename, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        module_logger.info("Dumped COPD augmented observations to %s", filename)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1488,11 +1620,41 @@ class RayPPOTrainer:
     def _empty_copd_analysis_result(self, analysis_mode: str) -> Dict[str, object]:
         return {
             "episode_summary": "",
-            "overall_hint": "",
-            "selected_steps": [],
+            "episode_hint": "",
             "step_hints": {},
             "analysis_mode": analysis_mode,
         }
+
+    @staticmethod
+    def _selected_steps_from_copd_analysis(analysis: Dict[object, object]) -> List[int]:
+        step_hints = analysis.get("step_hints", {}) or {}
+        if step_hints:
+            return [int(step_idx) for step_idx in step_hints.keys()]
+
+        # Backward-compatible fallback for old analysis dumps or in-flight jobs
+        # produced before step_hints carried the selected-step set.
+        return [int(step_idx) for step_idx in analysis.get("selected_steps", [])]
+
+    def _get_copd_failure_success_threshold(self) -> float:
+        threshold = OmegaConf.select(self.config, "algorithm.copd.failure_success_threshold")
+        return 1.0 if threshold is None else float(threshold)
+
+    def _build_copd_traj_success_map(self, batch: DataProto) -> Dict[object, float]:
+        if "episode_success" in batch.non_tensor_batch:
+            episode_success_np = np.asarray(batch.non_tensor_batch["episode_success"], dtype=np.float32)
+        elif "episode_rewards" in batch.non_tensor_batch:
+            threshold = self._get_copd_failure_success_threshold()
+            episode_success_np = (
+                np.asarray(batch.non_tensor_batch["episode_rewards"], dtype=np.float32) >= threshold
+            ).astype(np.float32)
+        else:
+            return {}
+
+        traj_success: Dict[object, float] = {}
+        for sample_idx, traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
+            if traj_uid not in traj_success:
+                traj_success[traj_uid] = float(episode_success_np[sample_idx])
+        return traj_success
 
     def _update_copd_guide_memory(
         self,
@@ -1552,7 +1714,6 @@ class RayPPOTrainer:
                     analyzer.analyze_episode,
                     steps=task["steps"],
                     candidate_step_indices=task["candidate_step_indices"],
-                    select_steps=task["select_steps"],
                     analysis_mode=task["analysis_mode"],
                     episode_success=task.get("episode_success"),
                 ): traj_uid
@@ -1583,19 +1744,26 @@ class RayPPOTrainer:
         response_mask = compute_response_mask(batch)
         zero_teacher_log_prob = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
         zero_critical_mask = torch.zeros(batch_size, dtype=torch.bool, device=batch.batch["responses"].device)
+        batch.batch["teacher_signal_mask"] = zero_critical_mask.clone()
         traj_uids = batch.non_tensor_batch.get("traj_uid", [])
         num_trajectories = len(set(traj_uids)) if len(traj_uids) > 0 else 0
-        analysis_mode = "teacher_bootstrap"
+        configured_failed_only = bool(OmegaConf.select(self.config, "algorithm.copd.failed_only"))
+        failed_only_after_steps = self._get_copd_failed_only_after_steps()
+        failed_only = self._should_copd_analyze_failed_only()
+        enhance_step_hint_only = bool(OmegaConf.select(self.config, "algorithm.copd.enhance_step_hint_only"))
+        analysis_mode = "failed_episode_opd" if failed_only else "teacher_bootstrap"
 
         module_logger.info(
-            "Preparing COPD analysis for batch_size=%s, num_trajectories=%s, selector=%s, analysis_backend=%s, analysis_mode=%s",
+            "Preparing COPD analysis for batch_size=%s, num_trajectories=%s, selector=%s, analysis_backend=%s, analysis_mode=%s, failed_only_after_steps=%s",
             batch_size,
             num_trajectories,
             self.config.algorithm.copd.selector,
             self.config.algorithm.copd.analysis_backend,
             analysis_mode,
+            failed_only_after_steps,
         )
-        metrics["copd/analysis_mode_teacher_bootstrap"] = 1.0
+        metrics["copd/analysis_mode_teacher_bootstrap"] = 0.0 if failed_only else 1.0
+        metrics["copd/analysis_mode_failed_episode_opd"] = 1.0 if failed_only else 0.0
         metrics["copd/guide_memory/episode_guided_step_ratio"] = 0.0
         metrics["copd/guide_memory/step_guided_step_ratio"] = 0.0
         metrics["copd/guide_memory/episode_guides_retrieved"] = 0.0
@@ -1616,6 +1784,14 @@ class RayPPOTrainer:
         selector = self.config.algorithm.copd.selector
         analyzer = self._lazy_init_copd_analyzer()
         metrics["copd/guide_memory/enabled"] = 1.0 if self._lazy_init_copd_guide_memory() is not None else 0.0
+        metrics["copd/failed_only"] = 1.0 if failed_only else 0.0
+        metrics["copd/failed_only_config"] = 1.0 if configured_failed_only else 0.0
+        metrics["copd/failed_only_after_steps"] = (
+            float(failed_only_after_steps) if failed_only_after_steps is not None else -1.0
+        )
+        metrics["copd/failed_only_schedule_active"] = 1.0 if failed_only_after_steps is not None else 0.0
+        metrics["copd/enhance_step_hint_only"] = 1.0 if enhance_step_hint_only else 0.0
+        metrics["copd/failure_success_threshold"] = self._get_copd_failure_success_threshold()
         critical_mask_np = np.zeros(batch_size, dtype=bool)
         selector_stats = {
             "num_groups": 0.0,
@@ -1650,17 +1826,24 @@ class RayPPOTrainer:
 
         episode_analysis: Dict[object, Dict[str, object]] = {}
         analysis_tasks: Dict[object, Dict[str, object]] = {}
-        episode_success_np = None
-        if "episode_success" in batch.non_tensor_batch:
-            episode_success_np = np.asarray(batch.non_tensor_batch["episode_success"], dtype=np.float32)
-        elif "episode_rewards" in batch.non_tensor_batch:
-            episode_success_np = (np.asarray(batch.non_tensor_batch["episode_rewards"], dtype=np.float32) > 0).astype(np.float32)
+        traj_success = self._build_copd_traj_success_map(batch)
+        if failed_only and not traj_success:
+            module_logger.warning(
+                "COPD failed_only is enabled, but episode_success/episode_rewards are missing; analyzing all trajectories."
+            )
 
-        traj_success: Dict[object, float] = {}
-        if episode_success_np is not None:
-            for sample_idx, traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
-                if traj_uid not in traj_success:
-                    traj_success[traj_uid] = float(episode_success_np[sample_idx])
+        def _should_analyze_traj(traj_uid: object) -> bool:
+            if not failed_only:
+                return True
+            success_value = traj_success.get(traj_uid)
+            if success_value is None:
+                return True
+            return success_value < 1.0
+
+        analyzed_traj_count = float(sum(1 for traj_uid in episodes if _should_analyze_traj(traj_uid)))
+        metrics["copd/analyzed_traj_count"] = analyzed_traj_count
+        metrics["copd/failed_traj_count"] = analyzed_traj_count
+        metrics["copd/skipped_success_traj_count"] = float(max(len(episodes) - int(analyzed_traj_count), 0))
         if selector == "stats":
             candidate_mask_np, selector_stats = core_copd.select_critical_steps_by_stats(
                 step_rewards=batch.batch["step_rewards"],
@@ -1682,6 +1865,8 @@ class RayPPOTrainer:
                 float(selector_stats["variance_cutoff"]),
             )
             for traj_uid, steps in episodes.items():
+                if not _should_analyze_traj(traj_uid):
+                    continue
                 candidate_step_indices = [
                     int(step_indices[sample_idx])
                     for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"])
@@ -1690,8 +1875,7 @@ class RayPPOTrainer:
                 if not candidate_step_indices:
                     episode_analysis[traj_uid] = {
                         "episode_summary": "",
-                        "overall_hint": "",
-                        "selected_steps": [],
+                        "episode_hint": "",
                         "step_hints": {},
                         "analysis_mode": analysis_mode,
                     }
@@ -1699,7 +1883,6 @@ class RayPPOTrainer:
                 analysis_tasks[traj_uid] = {
                     "steps": steps,
                     "candidate_step_indices": candidate_step_indices or None,
-                    "select_steps": False,
                     "analysis_mode": analysis_mode,
                     "episode_success": traj_success.get(traj_uid),
                 }
@@ -1707,14 +1890,16 @@ class RayPPOTrainer:
             episode_analysis.update(analyzed)
         elif selector == "llm":
             module_logger.info(
-                "COPD LLM selector will analyze %s trajectories for critical-step selection.",
+                "COPD LLM selector will analyze %s/%s trajectories for critical-step selection.",
+                int(analyzed_traj_count),
                 len(episodes),
             )
             for traj_uid, steps in episodes.items():
+                if not _should_analyze_traj(traj_uid):
+                    continue
                 analysis_tasks[traj_uid] = {
                     "steps": steps,
-                    "candidate_step_indices": None,
-                    "select_steps": True,
+                    "candidate_step_indices": [int(step["step_index"]) for step in steps],
                     "analysis_mode": analysis_mode,
                     "episode_success": traj_success.get(traj_uid),
                 }
@@ -1725,7 +1910,7 @@ class RayPPOTrainer:
 
         critical_mask_np = np.zeros(batch_size, dtype=bool)
         for traj_uid, analysis in episode_analysis.items():
-            selected_steps = set(int(step_idx) for step_idx in analysis.get("selected_steps", []))
+            selected_steps = set(self._selected_steps_from_copd_analysis(analysis))
             if not selected_steps:
                 continue
             for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
@@ -1776,7 +1961,19 @@ class RayPPOTrainer:
             batch.batch["critical_step_mask"] = critical_mask
             metrics["copd/teacher_batch_size"] = 0.0
             metrics["copd/teacher_available"] = 0.0
-            metrics["copd/teacher_skipped_after_phase_switch"] = 1.0
+            teacher_start_after_steps = self._get_copd_opd_start_after_steps()
+            phase_switch_after_steps = self._get_copd_phase_switch_after_steps()
+            metrics["copd/teacher_skipped_by_schedule"] = 1.0
+            metrics["copd/teacher_skipped_before_start"] = (
+                1.0
+                if teacher_start_after_steps is not None and self.global_steps <= teacher_start_after_steps
+                else 0.0
+            )
+            metrics["copd/teacher_skipped_after_phase_switch"] = (
+                1.0
+                if phase_switch_after_steps is not None and self.global_steps > phase_switch_after_steps
+                else 0.0
+            )
             self._update_copd_guide_memory(
                 batch=batch,
                 episode_analysis=episode_analysis,
@@ -1816,11 +2013,14 @@ class RayPPOTrainer:
 
         enhanced_obs_texts = []
         data_sources = []
+        augmented_observation_dump_entries: List[Dict[str, object]] = []
         critical_response_mask = response_mask[critical_indices]
         critical_responses = batch.batch["responses"][critical_indices]
         critical_preview = []
         guide_memory = self._lazy_init_copd_guide_memory()
-        teacher_use_guide_memory = bool(teacher_enabled and guide_memory is not None)
+        teacher_use_guide_memory = bool(
+            teacher_enabled and guide_memory is not None and not enhance_step_hint_only
+        )
         episode_guided_steps = 0
         step_guided_steps = 0
         episode_guides_retrieved = 0
@@ -1830,6 +2030,14 @@ class RayPPOTrainer:
             analysis = episode_analysis.get(traj_uid, {})
             step_hint = analysis.get("step_hints", {}).get(int(step_indices[sample_idx]), "")
             observation_text = str(base_obs_texts[sample_idx])
+            episode_summary = str(analysis.get("episode_summary", ""))
+            episode_hint = str(
+                analysis.get("episode_hint")
+                or analysis.get("overall_hint")
+                or episode_summary
+            )
+            episode_guides = []
+            step_guides = []
             if teacher_use_guide_memory:
                 retrieved = guide_memory.retrieve_for_observation(
                     observation=observation_text,
@@ -1842,20 +2050,32 @@ class RayPPOTrainer:
                 step_guides_retrieved += len(step_guides)
                 episode_guided_steps += int(len(episode_guides) > 0)
                 step_guided_steps += int(len(step_guides) > 0)
-                enhanced_obs = guide_memory.build_augmented_observation(
-                    observation=observation_text,
-                    episode_guides=episode_guides,
-                    step_guides=step_guides,
-                    episode_summary=str(analysis.get("episode_summary", "")),
-                    hindsight_hint=str(step_hint),
-                )
-            else:
-                enhanced_obs = core_copd.build_enhanced_observation_text(
-                    observation=observation_text,
-                    episode_summary=str(analysis.get("episode_summary", "")),
-                    hindsight_hint=str(step_hint),
-                )
+            enhanced_obs = build_augmented_observation_text(
+                observation=observation_text,
+                episode_guides=episode_guides,
+                step_guides=step_guides,
+                episode_hint="" if enhance_step_hint_only else episode_hint,
+                step_hint=str(step_hint),
+            )
             enhanced_obs_texts.append(enhanced_obs)
+            augmented_observation_dump_entries.append(
+                {
+                    "global_step": int(self.global_steps),
+                    "sample_idx": int(sample_idx),
+                    "traj_uid": str(traj_uid),
+                    "step_idx": int(step_indices[sample_idx]),
+                    "analysis_mode": analysis.get("analysis_mode"),
+                    "teacher_use_guide_memory": bool(teacher_use_guide_memory),
+                    "enhance_step_hint_only": bool(enhance_step_hint_only),
+                    "observation": observation_text,
+                    "augmented_observation": enhanced_obs,
+                    "episode_summary": episode_summary,
+                    "episode_hint": episode_hint,
+                    "hindsight_hint": str(step_hint),
+                    "episode_guides": [str(guide) for guide in episode_guides],
+                    "step_guides": [str(guide) for guide in step_guides],
+                }
+            )
             data_sources.append(
                 batch.non_tensor_batch["data_source"][sample_idx]
                 if "data_source" in batch.non_tensor_batch
@@ -1886,6 +2106,7 @@ class RayPPOTrainer:
             metrics.update(self._lazy_init_copd_guide_memory().snapshot_metrics(prefix="copd/guide_memory"))
         if critical_preview and module_logger.isEnabledFor(logging.DEBUG):
             module_logger.debug("COPD critical-step preview: %s", critical_preview)
+        self._dump_copd_augmented_observations(augmented_observation_dump_entries)
 
         teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
             obs_contents=enhanced_obs_texts,
@@ -1923,6 +2144,7 @@ class RayPPOTrainer:
         full_teacher_log_prob = zero_teacher_log_prob
         full_teacher_log_prob[critical_indices] = teacher_log_prob.batch["old_log_probs"]
         batch.batch["teacher_log_prob"] = full_teacher_log_prob
+        batch.batch["teacher_signal_mask"] = critical_mask
         teacher_lp = teacher_log_prob.batch["old_log_probs"]
 
         module_logger.info(

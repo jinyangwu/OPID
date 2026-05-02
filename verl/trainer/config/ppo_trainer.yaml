@@ -54,6 +54,9 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
+    opd_loss_coef: 0.0 # COPD auxiliary OPD distillation loss; 0 disables it
+    opd_loss_weight_mode: "delta" # "delta" or "importance"
+    opd_loss_clip: null # null disables clipping; otherwise clamps the OPD token weight magnitude
     entropy_coeff: 0.001
     use_invalid_action_penalty: True
     invalid_action_penalty_coef: 0.1
@@ -255,14 +258,19 @@ algorithm:
   copd:
     step_advantage_w: 1.0
     teacher_advantage_w: 1.0
+    opd_start_after_steps: null # null -> enable COPD teacher/OPD signal from the first training step; otherwise enable after this many completed steps
     teacher_advantage_w_start: null # null -> keep teacher_advantage_w constant; otherwise linearly ramp from start to teacher_advantage_w
-    teacher_advantage_w_ramp_steps: null # null -> use trainer.total_training_steps for the ramp length
+    teacher_advantage_w_ramp_steps: null # null -> use remaining trainer.total_training_steps after opd_start_after_steps for the ramp length
     phase_switch_after_steps: null
     use_with_memory_after_phase_switch: False
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False
     similarity_thresh: 0.95
     selector: "llm" # "stats" or "llm"
+    failed_only: False # if True, analyze and apply teacher OPD only on failed episodes
+    failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
+    failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
+    enhance_step_hint_only: False # if True, teacher prompts add only the selected step hint, without episode summary or guide memory
     stats_min_group_size: 2
     stats_var_quantile: 0.75
     stats_topk_per_traj: 1
@@ -273,6 +281,8 @@ algorithm:
     analysis_max_completion_tokens: 1024
     save_analysis: True
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/copd_analysis
+    save_augmented_observations: True
+    augmented_observation_dump_dir: null # null -> ${trainer.default_local_dir}/copd_augmented_observations
     normalize_teacher_adv: False
     clip_teacher_adv: null
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
@@ -354,3 +364,8 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  sciworld:
+    generalization_level: 0
+    simplifications_preset: easy
+    env_step_limit: 100
+    jar_path: null

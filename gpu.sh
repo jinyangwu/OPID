@@ -1,6 +1,6 @@
 while true; do
     # 获取 GPU 0 的显存使用量 (如果你是其他卡，修改 --id=0)
-    mem_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits --id=4)
+    mem_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits --id=0)
     # 判断显存是否小于 1000 MB
     if [ "$mem_used" -lt 4000 ]; then
         echo ">>> GPU 当前空闲 (${mem_used}MB)，立即启动脚本！"

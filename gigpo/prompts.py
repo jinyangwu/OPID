@@ -15,7 +15,7 @@ Return ONLY valid JSON with this schema:
       "improvement_hint": string
     }
   ],
-  "overall_hint": string
+  "episode_hint": string
 }
 
 - `episode_summary` should be a concise episode-level summary of what happened in the trajectory.
@@ -24,5 +24,5 @@ Return ONLY valid JSON with this schema:
 - `observation_excerpt` should quote or paraphrase only the most decision-relevant evidence from that step's observation.
 - `why_important` should explain why that step mattered for the downstream trajectory.
 - `improvement_hint` should explain how that step could be improved next time, but it must stay grounded in information available at or before that step.
-- `overall_hint` should be a short reusable lesson that summarizes the main takeaway from the trajectory.
+- `episode_hint` should be a short reusable lesson that summarizes the main takeaway from the trajectory.
 """

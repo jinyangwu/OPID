@@ -18,17 +18,22 @@ NUM_CPUS_PER_ENV_WORKER=${NUM_CPUS_PER_ENV_WORKER:-0.2}
 MAX_STEPS=${MAX_STEPS:-30}
 HISTORY_LENGTH=${HISTORY_LENGTH:-5}
 
+GIGPO_MODE=${GIGPO_MODE:-mean_norm}
+GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-1.0}
+GIGPO_ENABLE_SIMILARITY=${GIGPO_ENABLE_SIMILARITY:-False}
+GIGPO_SIMILARITY_THRESH=${GIGPO_SIMILARITY_THRESH:-0.95}
+
 # ScienceWorld-specific settings:
 # GENERALIZATION_LEVEL: 0 / 1 / 2
 # SIMPLIFICATIONS_PRESET: easy / medium / hard / empty string
 # SCIWORLD_JAR_PATH: set to null to use the builtin ScienceWorld jar
 GENERALIZATION_LEVEL=${GENERALIZATION_LEVEL:-0}
-SIMPLIFICATIONS_PRESET=${SIMPLIFICATIONS_PRESET-easy}
+SIMPLIFICATIONS_PRESET=${SIMPLIFICATIONS_PRESET:-easy}
 SCIWORLD_ENV_STEP_LIMIT=${SCIWORLD_ENV_STEP_LIMIT:-$MAX_STEPS}
 SCIWORLD_JAR_PATH=${SCIWORLD_JAR_PATH:-null}
 
 PROJECT_NAME=${PROJECT_NAME:-agentic_sciworld}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_1.5b_sciworld}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-gigpo_qwen2.5_1.5b_sciworld}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 TP_SIZE=${TP_SIZE:-1}
@@ -39,7 +44,7 @@ python3 -m examples.data_preprocess.prepare \
     --val_data_size "$VAL_DATA_SIZE"
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=gigpo \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$TRAIN_DATA_SIZE \
@@ -74,6 +79,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.use_kl_in_reward=False \
+    algorithm.gamma=0.95 \
+    algorithm.gigpo.step_advantage_w=$GIGPO_STEP_ADV_W \
+    algorithm.gigpo.mode=$GIGPO_MODE \
+    algorithm.gigpo.enable_similarity=$GIGPO_ENABLE_SIMILARITY \
+    algorithm.gigpo.similarity_thresh=$GIGPO_SIMILARITY_THRESH \
     env.env_name=sciworld \
     env.seed=0 \
     env.max_steps=$MAX_STEPS \

@@ -29,7 +29,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_opd_loss, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -322,6 +322,15 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        opd_loss_coef = float(self.config.get("opd_loss_coef", 0.0) or 0.0)
+        opd_mask_key = "teacher_signal_mask" if "teacher_signal_mask" in data.batch.keys() else "critical_step_mask"
+        use_opd_loss = (
+            opd_loss_coef > 0
+            and "teacher_log_prob" in data.batch.keys()
+            and opd_mask_key in data.batch.keys()
+        )
+        if use_opd_loss:
+            select_keys.extend(["teacher_log_prob", opd_mask_key])
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -415,6 +424,32 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
+                    opd_loss = log_prob.new_tensor(0.0)
+                    opd_active_token_ratio = log_prob.new_tensor(0.0)
+                    opd_weight_abs_mean = log_prob.new_tensor(0.0)
+                    opd_log_ratio_abs_mean = log_prob.new_tensor(0.0)
+                    opd_importance_ratio_mean = log_prob.new_tensor(0.0)
+                    opd_importance_ratio_max = log_prob.new_tensor(0.0)
+                    if use_opd_loss and "teacher_log_prob" in data and opd_mask_key in data:
+                        (
+                            opd_loss,
+                            opd_active_token_ratio,
+                            opd_weight_abs_mean,
+                            opd_log_ratio_abs_mean,
+                            opd_importance_ratio_mean,
+                            opd_importance_ratio_max,
+                        ) = compute_opd_loss(
+                            log_prob=log_prob,
+                            old_log_prob=old_log_prob,
+                            teacher_log_prob=data["teacher_log_prob"],
+                            response_mask=response_mask,
+                            opd_step_mask=data[opd_mask_key],
+                            weight_mode=self.config.get("opd_loss_weight_mode", "delta"),
+                            opd_clip=self.config.get("opd_loss_clip", None),
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        policy_loss = policy_loss + opd_loss_coef * opd_loss
+
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
                         # compute kl loss
@@ -437,6 +472,13 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        "actor/opd_loss": opd_loss.detach().item(),
+                        "actor/opd_loss_coef": opd_loss_coef,
+                        "actor/opd_active_token_ratio": opd_active_token_ratio.detach().item(),
+                        "actor/opd_weight_abs_mean": opd_weight_abs_mean.detach().item(),
+                        "actor/opd_log_ratio_abs_mean": opd_log_ratio_abs_mean.detach().item(),
+                        "actor/opd_importance_ratio_mean": opd_importance_ratio_mean.detach().item(),
+                        "actor/opd_importance_ratio_max": opd_importance_ratio_max.detach().item(),
                     }
                     append_to_dict(metrics, data)
 

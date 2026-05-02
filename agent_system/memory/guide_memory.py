@@ -62,6 +62,92 @@ def _stable_hash(parts: Iterable[str]) -> str:
     return digest.hexdigest()
 
 
+def build_augmented_observation_text(
+    *,
+    observation: str,
+    episode_guides: Sequence[str],
+    step_guides: Sequence[str],
+    episode_hint: str = "",
+    step_hint: str = "",
+) -> str:
+    def _format_guidance_section(title: str, instruction: str, body: Any) -> str:
+        body_text = str(body).strip()
+        if not body_text:
+            return ""
+        return f"**{title}**\n{instruction}:\n[{body_text}]"
+
+    def _insert_before_anchor(prompt_text: str, sections: Sequence[str], anchors: Sequence[str]) -> str:
+        merged_sections = [str(section).strip() for section in sections if str(section or "").strip()]
+        if not merged_sections:
+            return prompt_text
+
+        insertion_block = "\n\n".join(merged_sections)
+        for anchor in anchors:
+            anchor_idx = prompt_text.find(anchor)
+            if anchor_idx == -1:
+                continue
+
+            prefix = prompt_text[:anchor_idx].rstrip()
+            suffix = prompt_text[anchor_idx:].lstrip()
+            if prefix and suffix:
+                return f"{prefix}\n\n{insertion_block}\n\n{suffix}"
+            if prefix:
+                return f"{prefix}\n\n{insertion_block}"
+            return f"{insertion_block}\n\n{suffix}"
+
+        return f"{prompt_text}\n\n{insertion_block}" if prompt_text else insertion_block
+
+    augmented_observation = str(observation).strip()
+    episode_sections = []
+    detail_sections = []
+
+    if episode_guides:
+        episode_sections.append(
+            _format_guidance_section(
+                "Guide Memory: Episode-Level Strategy",
+                "Use the retrieved episode-level guidance to keep the overall task strategy in mind.",
+                "\n".join(f"- {guide}" for guide in episode_guides),
+            )
+        )
+    if step_guides:
+        detail_sections.append(
+            _format_guidance_section(
+                "Guide Memory: Similar-Step Action Hints",
+                "Use these retrieved hints as references for choosing the next admissible action in the current state.",
+                "\n".join(f"- {guide}" for guide in step_guides),
+            )
+        )
+    if episode_hint:
+        detail_sections.append(
+            _format_guidance_section(
+                "Episode-Level Hint",
+                "This hint summarizes the intended strategy for the whole task; use it to guide planning across steps.",
+                episode_hint,
+            )
+        )
+    if step_hint:
+        detail_sections.append(
+            _format_guidance_section(
+                "Current-Step Decision Guidance",
+                (
+                    "This is policy-facing advice for the current decision point. "
+                    "Use it to guide your reasoning and select the next admissible action."
+                ),
+                step_hint,
+            )
+        )
+
+    augmented_observation = _insert_before_anchor(
+        augmented_observation,
+        episode_sections + detail_sections,
+        (
+            "Now it's your turn to",
+            "Now it's your turn",
+        ),
+    )
+    return augmented_observation
+
+
 @dataclass
 class GuideRecord:
     guide_id: str
@@ -382,65 +468,17 @@ class COPDGuideMemory:
         observation: str,
         episode_guides: Sequence[str],
         step_guides: Sequence[str],
+        episode_hint: str = "",
         episode_summary: str = "",
         hindsight_hint: str = "",
     ) -> str:
-        def _insert_before_anchor(prompt_text: str, sections: Sequence[str], anchors: Sequence[str]) -> str:
-            merged_sections = [str(section).strip() for section in sections if str(section or "").strip()]
-            if not merged_sections:
-                return prompt_text
-
-            insertion_block = "\n\n".join(merged_sections)
-            for anchor in anchors:
-                anchor_idx = prompt_text.find(anchor)
-                if anchor_idx == -1:
-                    continue
-
-                prefix = prompt_text[:anchor_idx].rstrip()
-                suffix = prompt_text[anchor_idx:].lstrip()
-                if prefix and suffix:
-                    return f"{prefix}\n\n{insertion_block}\n\n{suffix}"
-                if prefix:
-                    return f"{prefix}\n\n{insertion_block}"
-                return f"{insertion_block}\n\n{suffix}"
-
-            return f"{prompt_text}\n\n{insertion_block}" if prompt_text else insertion_block
-
-        augmented_observation = str(observation).strip()
-        episode_sections = []
-        detail_sections = []
-
-        if episode_guides:
-            episode_sections.append("[Guide Memory: Episode]\n" + "\n".join(f"- {guide}" for guide in episode_guides))
-        if step_guides:
-            detail_sections.append("[Guide Memory: Step]\n" + "\n".join(f"- {guide}" for guide in step_guides))
-        if episode_summary:
-            detail_sections.append("[Episode Summary]\n" + str(episode_summary).strip())
-        if hindsight_hint:
-            detail_sections.append("[Hindsight Hint For Current Step]\n" + str(hindsight_hint).strip())
-
-        augmented_observation = _insert_before_anchor(
-            augmented_observation,
-            episode_sections,
-            (
-                "## Current Progress",
-                "Prior to this step",
-                "You are now at step",
-                "Your current observation is",
-                "Your admissible actions",
-                "Now it's your turn",
-            ),
+        return build_augmented_observation_text(
+            observation=observation,
+            episode_guides=episode_guides,
+            step_guides=step_guides,
+            episode_hint=episode_hint or episode_summary,
+            step_hint=hindsight_hint,
         )
-        augmented_observation = _insert_before_anchor(
-            augmented_observation,
-            detail_sections,
-            (
-                "Your admissible actions",
-                "Now it's your turn",
-                "You should first reason",
-            ),
-        )
-        return augmented_observation
 
     def format_for_rollout_prompt(
         self,
@@ -450,9 +488,17 @@ class COPDGuideMemory:
     ) -> str:
         sections = []
         if episode_guides:
-            sections.append("## Guide Memory: Episode\n" + "\n".join(f"- {guide}" for guide in episode_guides))
+            sections.append(
+                "## Guide Memory: Episode-Level Strategy\n"
+                "Use the retrieved episode-level guidance to keep the overall task strategy in mind.\n"
+                + "\n".join(f"- {guide}" for guide in episode_guides)
+            )
         if step_guides:
-            sections.append("## Guide Memory: Step\n" + "\n".join(f"- {guide}" for guide in step_guides))
+            sections.append(
+                "## Guide Memory: Similar-Step Action Hints\n"
+                "Use these retrieved hints as references for choosing the next admissible action in the current state.\n"
+                + "\n".join(f"- {guide}" for guide in step_guides)
+            )
         return "\n\n".join(section for section in sections if section)
 
     def update_from_episode_analysis(
@@ -507,7 +553,10 @@ class COPDGuideMemory:
             analysis = episode_analysis.get(traj_uid, {})
             traj_success_value = traj_success.get(traj_uid)
             episode_guide_text = str(
-                analysis.get("overall_hint") or analysis.get("episode_summary") or ""
+                analysis.get("episode_hint")
+                or analysis.get("overall_hint")
+                or analysis.get("episode_summary")
+                or ""
             ).strip()
             if episode_guide_text:
                 added = self._add_episode_guide(

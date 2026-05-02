@@ -1,10 +1,12 @@
 set -x
 
+# Runtime backend.
 ENGINE=vllm
 
 ulimit -u 65536
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
+# Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
 MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-1.5B-Instruct}
 TRAIN_DATA_SIZE=16
@@ -12,30 +14,53 @@ VAL_DATA_SIZE=128
 GROUP_SIZE=8
 NUM_CPUS_PER_ENV_WORKER=0.1
 
+# COPD advantage, teacher/OPD signal schedule, and phase control.
 COPD_MODE=mean_norm
-COPD_SELECTOR=stats
+COPD_STEP_ADV_W=0
+COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-0.0}
+COPD_OPD_START_AFTER_STEPS=${COPD_OPD_START_AFTER_STEPS:-10}
+COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-null}
+
+# COPD episode filtering and teacher prompt construction.
+COPD_FAILED_ONLY=${COPD_FAILED_ONLY:-False}
+COPD_FAILED_ONLY_AFTER_STEPS=${COPD_FAILED_ONLY_AFTER_STEPS:-null}
+COPD_FAILURE_SUCCESS_THRESHOLD=${COPD_FAILURE_SUCCESS_THRESHOLD:-1.0}
+COPD_ENHANCE_STEP_HINT_ONLY=${COPD_ENHANCE_STEP_HINT_ONLY:-False}
+
+# COPD critical-step selection and analysis.
+COPD_SELECTOR=${COPD_SELECTOR:-llm}
 COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
-COPD_STEP_ADV_W=1
-COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-1.0}
-COPD_TEACHER_ADV_W_START=${COPD_TEACHER_ADV_W_START:-0.1}
-COPD_TEACHER_ADV_W_RAMP_STEPS=${COPD_TEACHER_ADV_W_RAMP_STEPS:-null}
-COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-0}
-COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH=${COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH:-True}
 COPD_STATS_MIN_GROUP_SIZE=2
 COPD_STATS_VAR_QUANTILE=0.75
-COPD_STATS_TOPK_PER_TRAJ=6
+COPD_STATS_TOPK_PER_TRAJ=5
 COPD_SIMILARITY_THRESH=0.95
-SKILLS_JSON_PATH=${SKILLS_JSON_PATH:-memory_data/alfworld/claude_style_skills.json}
-SKILL_RETRIEVAL_MODE=${SKILL_RETRIEVAL_MODE:-template}
-SKILL_TOP_K=${SKILL_TOP_K:-6}
 
-PROJECT_NAME=agentic_alfworld
-EXPERIMENT_NAME=copd_qwen2.5_1.5b_alfworld_stats_exit-0_mem
+# Auxiliary OPD loss.
+COPD_OPD_LOSS_COEF=${COPD_OPD_LOSS_COEF:-0.001}
+COPD_OPD_LOSS_WEIGHT_MODE=${COPD_OPD_LOSS_WEIGHT_MODE:-importance}
+COPD_OPD_LOSS_CLIP=${COPD_OPD_LOSS_CLIP:-0.4}
+
+# Guide memory retrieval and storage behavior.
+GUIDE_MEMORY_ENABLE=${GUIDE_MEMORY_ENABLE:-True}
+GUIDE_EPISODE_ENABLE=${GUIDE_EPISODE_ENABLE:-False}
+GUIDE_STEP_ENABLE=${GUIDE_STEP_ENABLE:-False}
+GUIDE_EPISODE_TOP_K=${GUIDE_EPISODE_TOP_K:-1}
+GUIDE_STEP_TOP_K=${GUIDE_STEP_TOP_K:-1}
+GUIDE_PROMOTE_MIN_SUPPORT=${GUIDE_PROMOTE_MIN_SUPPORT:-1}
+GUIDE_MERGE_SIMILARITY_THRESH=${GUIDE_MERGE_SIMILARITY_THRESH:-0.9}
+GUIDE_STATE_SIMILARITY_THRESH=${GUIDE_STATE_SIMILARITY_THRESH:-0.95}
+GUIDE_MAX_EPISODE_GUIDES_PER_TASK=${GUIDE_MAX_EPISODE_GUIDES_PER_TASK:-8}
+GUIDE_MAX_STEP_GUIDES_PER_TASK=${GUIDE_MAX_STEP_GUIDES_PER_TASK:-24}
+
+# Experiment naming and output location.
+PROJECT_NAME=agentic_webshop
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_webshop_llm-5_no-guide_opd-loss-importance-0.001_start-10}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
-history_length=5
-# We only use data preparation to indicate the modality and the data size.
+# Prompt observation history.
+history_length=2
+
 python3 -m examples.data_preprocess.prepare \
     --mode text \
     --train_data_size "$TRAIN_DATA_SIZE" \
@@ -47,7 +72,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$TRAIN_DATA_SIZE \
     data.val_batch_size=$VAL_DATA_SIZE \
-    data.max_prompt_length=3048 \
+    data.max_prompt_length=6000 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation=left \
@@ -55,16 +80,19 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.opd_loss_coef=$COPD_OPD_LOSS_COEF \
+    actor_rollout_ref.actor.opd_loss_weight_mode=$COPD_OPD_LOSS_WEIGHT_MODE \
+    actor_rollout_ref.actor.opd_loss_clip=$COPD_OPD_LOSS_CLIP \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -72,7 +100,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
@@ -80,10 +108,13 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
-    algorithm.copd.teacher_advantage_w_start=$COPD_TEACHER_ADV_W_START \
-    algorithm.copd.teacher_advantage_w_ramp_steps=$COPD_TEACHER_ADV_W_RAMP_STEPS \
+    algorithm.copd.opd_start_after_steps=$COPD_OPD_START_AFTER_STEPS \
     algorithm.copd.phase_switch_after_steps=$COPD_PHASE_SWITCH_AFTER_STEPS \
-    algorithm.copd.use_with_memory_after_phase_switch=$COPD_USE_WITH_MEMORY_AFTER_PHASE_SWITCH \
+    algorithm.copd.use_with_memory_after_phase_switch=False \
+    algorithm.copd.failed_only=$COPD_FAILED_ONLY \
+    algorithm.copd.failed_only_after_steps=$COPD_FAILED_ONLY_AFTER_STEPS \
+    algorithm.copd.failure_success_threshold=$COPD_FAILURE_SUCCESS_THRESHOLD \
+    algorithm.copd.enhance_step_hint_only=$COPD_ENHANCE_STEP_HINT_ONLY \
     algorithm.copd.mode=$COPD_MODE \
     algorithm.copd.selector=$COPD_SELECTOR \
     algorithm.copd.enable_similarity=False \
@@ -97,25 +128,32 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.analysis_max_history_steps=15 \
     algorithm.copd.analysis_max_completion_tokens=4096 \
     algorithm.copd.normalize_teacher_adv=False \
+    env.guide_memory.enable=$GUIDE_MEMORY_ENABLE \
+    env.guide_memory.episode_enable=$GUIDE_EPISODE_ENABLE \
+    env.guide_memory.step_enable=$GUIDE_STEP_ENABLE \
+    env.guide_memory.episode_top_k=$GUIDE_EPISODE_TOP_K \
+    env.guide_memory.step_top_k=$GUIDE_STEP_TOP_K \
+    env.guide_memory.promote_min_support=$GUIDE_PROMOTE_MIN_SUPPORT \
+    env.guide_memory.merge_similarity_thresh=$GUIDE_MERGE_SIMILARITY_THRESH \
+    env.guide_memory.state_similarity_thresh=$GUIDE_STATE_SIMILARITY_THRESH \
+    env.guide_memory.max_episode_guides_per_task=$GUIDE_MAX_EPISODE_GUIDES_PER_TASK \
+    env.guide_memory.max_step_guides_per_task=$GUIDE_MAX_STEP_GUIDES_PER_TASK \
     env.history_length=$history_length \
-    env.env_name=alfworld/AlfredTWEnv \
+    env.env_name=Webshop \
     env.seed=0 \
-    env.max_steps=30 \
+    env.max_steps=15 \
     env.rollout.n=$GROUP_SIZE \
     env.resources_per_worker.num_cpus=$NUM_CPUS_PER_ENV_WORKER \
-    +env.use_skills_only_memory=True \
-    +env.skills_only_memory.skills_json_path=$SKILLS_JSON_PATH \
-    +env.skills_only_memory.retrieval_mode=$SKILL_RETRIEVAL_MODE \
-    +env.skills_only_memory.top_k=$SKILL_TOP_K \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=160 \
     trainer.val_before_train=False \
     trainer.default_local_dir=$DEFAULT_LOCAL_DIR \
-    trainer.rollout_data_dir=$DEFAULT_LOCAL_DIR
+    trainer.rollout_data_dir=$DEFAULT_LOCAL_DIR \
+    $@
