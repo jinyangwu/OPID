@@ -442,6 +442,14 @@ def compute_copd_advantage_components(
         step_group_uids=step_group_uids,
         prefix=metrics_prefix,
     )
+    step_group_counts = Counter(
+        step_group_uids.tolist()
+        if isinstance(step_group_uids, np.ndarray)
+        else list(step_group_uids)
+    )
+    step_group_metrics[f"{metrics_prefix}/raw_group_sizes"] = [
+        int(size) for size in step_group_counts.values()
+    ]
     step_advantages = step_norm_reward(
         step_rewards=step_rewards,
         response_mask=response_mask,

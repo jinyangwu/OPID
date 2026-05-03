@@ -348,7 +348,42 @@ class COPDEpisodeAnalyzer:
         task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
 
         summary_instruction = "Write a concise episode_summary."
-        episode_hint_instruction = "Write one reusable episode_hint distilled from the trajectory."
+        outcome_label = "unknown"
+        if episode_success is not None:
+            try:
+                outcome_label = "success" if float(episode_success) >= 1.0 else "failure"
+            except (TypeError, ValueError):
+                outcome_label = "unknown"
+
+        if outcome_label == "success":
+            episode_hint_instruction = (
+                "Write one reusable episode_hint that extracts the successful workflow: "
+                "the key observation checks, action ordering, decision rules, and strategy "
+                "that made this trajectory work."
+            )
+            outcome_instruction = (
+                "Because this is a successful episode, episode_hint should be a positive, reusable workflow "
+                "that explains how to complete similar tasks well."
+            )
+        elif outcome_label == "failure":
+            episode_hint_instruction = (
+                "Write one reusable episode_hint that explains why the trajectory failed and how to avoid "
+                "that failure pattern next time; emphasize warning signs, bad decision points, and safer "
+                "alternative workflow choices."
+            )
+            outcome_instruction = (
+                "Because this is a failed episode, episode_hint should focus on the failure cause and "
+                "concrete avoidance guidance, not on copying the failed actions."
+            )
+        else:
+            episode_hint_instruction = (
+                "Write one reusable episode_hint distilled from the trajectory. If it succeeded, extract "
+                "the successful workflow; if it failed, explain the failure cause and how to avoid it."
+            )
+            outcome_instruction = (
+                "Use episode_success and the trajectory evidence to decide whether episode_hint should "
+                "capture a success workflow or failure-avoidance guidance."
+            )
         selection_instruction = (
             f"Provide concise, action-oriented decision guidance for at most {max_hint_count} critical step(s) "
             "from the candidate set as entries in step_hints; use the full episode to infer the guidance, "
@@ -364,6 +399,7 @@ You need to complete all three fields:
 Important constraints:
 - Step indexing is 0-based: step 0 is the first step of the trajectory.
 - Use the task description together with the episode context to judge progress and mistakes.
+- {outcome_instruction}
 - Use the full episode context to identify what each critical step should have done better.
 - Each step_hints value should be one short imperative sentence for the policy at that step.
 - Write step_hints as policy-facing guidance, not as retrospective explanation of the trajectory.
@@ -383,6 +419,7 @@ Return format:
 Episode context:
 - Task description: {task_description or "(not available)"}
 - episode_success: {episode_success}
+- interpreted_outcome: {outcome_label}
 - Candidate step indices: {candidate_step_indices}
 - Interaction trajectory: {self._format_episode_steps(steps)}
 """

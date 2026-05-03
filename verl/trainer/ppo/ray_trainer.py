@@ -29,7 +29,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
 import numpy as np
 import ray
@@ -70,6 +70,7 @@ from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
 module_logger = logging.getLogger(__name__)
+COPD_STATE_GROUP_METRIC_PREFIX = "copd/state_group/"
 
 
 class Role(Enum):
@@ -1128,6 +1129,215 @@ class RayPPOTrainer:
 
         module_logger.info("Dumped COPD augmented observations to %s", filename)
 
+    def _get_copd_state_group_dump_dir(self) -> Optional[str]:
+        save_state_group_metrics = OmegaConf.select(
+            self.config,
+            "algorithm.copd.save_state_group_metrics",
+        )
+        if save_state_group_metrics is False:
+            return None
+
+        dump_dir = OmegaConf.select(
+            self.config,
+            "algorithm.copd.state_group_dump_dir",
+        )
+        if dump_dir:
+            return dump_dir
+
+        return os.path.join(
+            self.config.trainer.default_local_dir,
+            "copd_state_group",
+        )
+
+    @staticmethod
+    def _metric_value_to_json(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().cpu()
+            if tensor.numel() == 1:
+                return tensor.item()
+            return tensor.tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, dict):
+            return {
+                str(key): RayPPOTrainer._metric_value_to_json(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [RayPPOTrainer._metric_value_to_json(item) for item in value]
+        return str(value)
+
+    @staticmethod
+    def _extract_copd_state_group_histogram(
+        state_group_metrics: Dict[str, Any],
+    ) -> List[Dict[str, float]]:
+        histogram = []
+        for key, value in state_group_metrics.items():
+            if not key.startswith(COPD_STATE_GROUP_METRIC_PREFIX):
+                continue
+            metric_name = key[len(COPD_STATE_GROUP_METRIC_PREFIX):]
+            if not metric_name.startswith("size_") or not metric_name.endswith("_group_count"):
+                continue
+            label = metric_name[len("size_"):-len("_group_count")]
+            count = float(value)
+            group_prop = float(
+                state_group_metrics.get(
+                    f"{COPD_STATE_GROUP_METRIC_PREFIX}size_{label}_group_prop",
+                    0.0,
+                )
+            )
+            sample_prop = float(
+                state_group_metrics.get(
+                    f"{COPD_STATE_GROUP_METRIC_PREFIX}size_{label}_sample_prop",
+                    0.0,
+                )
+            )
+            histogram.append(
+                {
+                    "label": f">{label[3:]}" if label.startswith("gt_") else label,
+                    "group_count": count,
+                    "group_prop": group_prop,
+                    "sample_prop": sample_prop,
+                }
+            )
+
+        def _sort_key(item: Dict[str, float]) -> float:
+            label = str(item["label"])
+            if label.startswith(">"):
+                return float(label[1:]) + 0.5
+            return float(label)
+
+        histogram.sort(key=_sort_key)
+        return histogram
+
+    @staticmethod
+    def _build_copd_state_group_svg(
+        *,
+        global_step: int,
+        histogram: List[Dict[str, float]],
+        summary: Dict[str, Any],
+    ) -> str:
+        width = 960
+        height = 520
+        margin_left = 72
+        margin_right = 32
+        margin_top = 74
+        margin_bottom = 82
+        plot_width = width - margin_left - margin_right
+        plot_height = height - margin_top - margin_bottom
+        max_count = max((float(item["group_count"]) for item in histogram), default=0.0)
+        y_max = max(max_count, 1.0)
+        bar_gap = 12
+        bar_width = (
+            (plot_width - bar_gap * max(len(histogram) - 1, 0)) / max(len(histogram), 1)
+        )
+        title = f"COPD State Group Size Distribution - Step {global_step}"
+        subtitle = (
+            f"groups={summary.get('num_groups', 0)}, samples={summary.get('num_samples', 0)}, "
+            f"mean={float(summary.get('mean', 0.0)):.2f}, std={float(summary.get('std', 0.0)):.2f}"
+        )
+
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            '<rect width="100%" height="100%" fill="#ffffff"/>',
+            f'<text x="{margin_left}" y="32" font-family="Arial, sans-serif" font-size="20" font-weight="700" fill="#111827">{title}</text>',
+            f'<text x="{margin_left}" y="56" font-family="Arial, sans-serif" font-size="13" fill="#4b5563">{subtitle}</text>',
+            f'<line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{margin_left + plot_width}" y2="{margin_top + plot_height}" stroke="#111827" stroke-width="1"/>',
+            f'<line x1="{margin_left}" y1="{margin_top}" x2="{margin_left}" y2="{margin_top + plot_height}" stroke="#111827" stroke-width="1"/>',
+        ]
+
+        for tick_idx in range(5):
+            ratio = tick_idx / 4
+            y = margin_top + plot_height - ratio * plot_height
+            value = y_max * ratio
+            parts.append(
+                f'<line x1="{margin_left - 4}" y1="{y:.1f}" x2="{margin_left + plot_width}" y2="{y:.1f}" stroke="#e5e7eb" stroke-width="1"/>'
+            )
+            parts.append(
+                f'<text x="{margin_left - 10}" y="{y + 4:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#6b7280">{value:.0f}</text>'
+            )
+
+        for idx, item in enumerate(histogram):
+            x = margin_left + idx * (bar_width + bar_gap)
+            count = float(item["group_count"])
+            bar_height = 0.0 if y_max <= 0 else (count / y_max) * plot_height
+            y = margin_top + plot_height - bar_height
+            label = str(item["label"])
+            parts.append(
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{bar_height:.1f}" fill="#2563eb" rx="2"/>'
+            )
+            parts.append(
+                f'<text x="{x + bar_width / 2:.1f}" y="{max(y - 6, margin_top + 12):.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">{count:.0f}</text>'
+            )
+            parts.append(
+                f'<text x="{x + bar_width / 2:.1f}" y="{margin_top + plot_height + 22}" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#374151">{label}</text>'
+            )
+
+        parts.append(
+            f'<text x="{margin_left + plot_width / 2}" y="{height - 24}" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" fill="#374151">Group size bucket</text>'
+        )
+        parts.append(
+            f'<text x="20" y="{margin_top + plot_height / 2}" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" fill="#374151" transform="rotate(-90 20 {margin_top + plot_height / 2})">Number of groups</text>'
+        )
+        parts.append("</svg>")
+        return "\n".join(parts)
+
+    def _dump_and_remove_copd_state_group_metrics(self, metrics: Dict[str, Any]) -> None:
+        state_group_metrics = {
+            key: metrics.pop(key)
+            for key in list(metrics.keys())
+            if key.startswith(COPD_STATE_GROUP_METRIC_PREFIX)
+        }
+        if not state_group_metrics:
+            return
+
+        dump_dir = self._get_copd_state_group_dump_dir()
+        if dump_dir is None:
+            return
+
+        os.makedirs(dump_dir, exist_ok=True)
+        raw_metrics = {
+            key: self._metric_value_to_json(value)
+            for key, value in sorted(state_group_metrics.items())
+        }
+        histogram = self._extract_copd_state_group_histogram(raw_metrics)
+        summary = {
+            key[len(COPD_STATE_GROUP_METRIC_PREFIX):]: value
+            for key, value in raw_metrics.items()
+            if key.startswith(COPD_STATE_GROUP_METRIC_PREFIX)
+            and not key[len(COPD_STATE_GROUP_METRIC_PREFIX):].startswith("size_")
+            and not key[len(COPD_STATE_GROUP_METRIC_PREFIX):].startswith("raw_")
+        }
+        payload = {
+            "global_step": int(self.global_steps),
+            "raw_metrics": raw_metrics,
+            "raw_group_sizes": raw_metrics.get(
+                f"{COPD_STATE_GROUP_METRIC_PREFIX}raw_group_sizes",
+                [],
+            ),
+            "histogram": histogram,
+            "summary": summary,
+        }
+
+        json_path = os.path.join(dump_dir, f"step_{self.global_steps:08d}.json")
+        svg_path = os.path.join(dump_dir, f"step_{self.global_steps:08d}.svg")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        with open(svg_path, "w", encoding="utf-8") as f:
+            f.write(
+                self._build_copd_state_group_svg(
+                    global_step=int(self.global_steps),
+                    histogram=histogram,
+                    summary=summary,
+                )
+            )
+
+        module_logger.info("Dumped COPD state-group metrics to %s and %s", json_path, svg_path)
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -1605,11 +1815,12 @@ class RayPPOTrainer:
             return None
 
         module_logger.info(
-            "Initializing COPD guide memory with episode_enable=%s, step_enable=%s, episode_top_k=%s, step_top_k=%s",
-            guide_config.get("episode_enable", True),
-            guide_config.get("step_enable", True),
-            guide_config.get("episode_top_k", 1),
-            guide_config.get("step_top_k", 1),
+            "Initializing COPD guide memory with top_k=%s, similarity_threshold=%s, embedding_model_path=%s, embedding_batch_size=%s, embedding_device=%s",
+            guide_config.get("top_k", 2),
+            guide_config.get("similarity_threshold", 0.3),
+            guide_config.get("embedding_model_path", "/raid3/data/GTPO/MODELS/Qwen3-Embedding-0.6B"),
+            guide_config.get("embedding_batch_size", 64),
+            guide_config.get("embedding_device", None),
         )
         self._copd_guide_memory = COPDGuideMemory(
             config=guide_config,
@@ -1764,10 +1975,8 @@ class RayPPOTrainer:
         )
         metrics["copd/analysis_mode_teacher_bootstrap"] = 0.0 if failed_only else 1.0
         metrics["copd/analysis_mode_failed_episode_opd"] = 1.0 if failed_only else 0.0
-        metrics["copd/guide_memory/episode_guided_step_ratio"] = 0.0
-        metrics["copd/guide_memory/step_guided_step_ratio"] = 0.0
-        metrics["copd/guide_memory/episode_guides_retrieved"] = 0.0
-        metrics["copd/guide_memory/step_guides_retrieved"] = 0.0
+        metrics["copd/guide_memory/skill_guided_step_ratio"] = 0.0
+        metrics["copd/guide_memory/skills_retrieved"] = 0.0
 
         if "obs_text" not in batch.non_tensor_batch:
             module_logger.warning("COPD teacher signal skipped because obs_text is missing from the rollout batch.")
@@ -2021,11 +2230,30 @@ class RayPPOTrainer:
         teacher_use_guide_memory = bool(
             teacher_enabled and guide_memory is not None and not enhance_step_hint_only
         )
-        episode_guided_steps = 0
-        step_guided_steps = 0
-        episode_guides_retrieved = 0
-        step_guides_retrieved = 0
-        for sample_idx in critical_indices:
+        skill_guided_steps = 0
+        skills_retrieved = 0
+        retrieval_results_by_critical_pos = []
+        if teacher_use_guide_memory:
+            critical_observation_texts = [
+                str(base_obs_texts[sample_idx])
+                for sample_idx in critical_indices
+            ]
+            anchor_obs_values = batch.non_tensor_batch.get("anchor_obs")
+            critical_anchor_observations = (
+                [
+                    anchor_obs_values[sample_idx]
+                    for sample_idx in critical_indices
+                ]
+                if anchor_obs_values is not None
+                else None
+            )
+            retrieval_results_by_critical_pos = guide_memory.retrieve_for_observations(
+                observations=critical_observation_texts,
+                anchor_observations=critical_anchor_observations,
+                global_step=self.global_steps,
+            )
+
+        for critical_pos, sample_idx in enumerate(critical_indices):
             traj_uid = batch.non_tensor_batch["traj_uid"][sample_idx]
             analysis = episode_analysis.get(traj_uid, {})
             step_hint = analysis.get("step_hints", {}).get(int(step_indices[sample_idx]), "")
@@ -2036,25 +2264,17 @@ class RayPPOTrainer:
                 or analysis.get("overall_hint")
                 or episode_summary
             )
-            episode_guides = []
-            step_guides = []
-            if teacher_use_guide_memory:
-                retrieved = guide_memory.retrieve_for_observation(
-                    observation=observation_text,
-                    anchor_observation=batch.non_tensor_batch.get("anchor_obs", [None] * batch_size)[sample_idx],
-                    global_step=self.global_steps,
-                )
-                episode_guides = retrieved.get("episode_guides", [])
-                step_guides = retrieved.get("step_guides", [])
-                episode_guides_retrieved += len(episode_guides)
-                step_guides_retrieved += len(step_guides)
-                episode_guided_steps += int(len(episode_guides) > 0)
-                step_guided_steps += int(len(step_guides) > 0)
+            retrieved_skills = []
+            retrieved_skill_records = []
+            if teacher_use_guide_memory and critical_pos < len(retrieval_results_by_critical_pos):
+                retrieved = retrieval_results_by_critical_pos[critical_pos]
+                retrieved_skills = retrieved.get("skills", [])
+                retrieved_skill_records = retrieved.get("skill_records", [])
+                skills_retrieved += len(retrieved_skills)
+                skill_guided_steps += int(len(retrieved_skills) > 0)
             enhanced_obs = build_augmented_observation_text(
                 observation=observation_text,
-                episode_guides=episode_guides,
-                step_guides=step_guides,
-                episode_hint="" if enhance_step_hint_only else episode_hint,
+                skills=retrieved_skills,
                 step_hint=str(step_hint),
             )
             enhanced_obs_texts.append(enhanced_obs)
@@ -2072,8 +2292,8 @@ class RayPPOTrainer:
                     "episode_summary": episode_summary,
                     "episode_hint": episode_hint,
                     "hindsight_hint": str(step_hint),
-                    "episode_guides": [str(guide) for guide in episode_guides],
-                    "step_guides": [str(guide) for guide in step_guides],
+                    "retrieved_skills": [str(skill) for skill in retrieved_skills],
+                    "retrieved_skill_records": retrieved_skill_records,
                 }
             )
             data_sources.append(
@@ -2092,10 +2312,8 @@ class RayPPOTrainer:
                 )
 
         if len(critical_indices) > 0:
-            metrics["copd/guide_memory/episode_guided_step_ratio"] = float(episode_guided_steps / len(critical_indices))
-            metrics["copd/guide_memory/step_guided_step_ratio"] = float(step_guided_steps / len(critical_indices))
-        metrics["copd/guide_memory/episode_guides_retrieved"] = float(episode_guides_retrieved)
-        metrics["copd/guide_memory/step_guides_retrieved"] = float(step_guides_retrieved)
+            metrics["copd/guide_memory/skill_guided_step_ratio"] = float(skill_guided_steps / len(critical_indices))
+        metrics["copd/guide_memory/skills_retrieved"] = float(skills_retrieved)
 
         module_logger.info(
             "COPD built %s enhanced observations for teacher scoring across %s trajectories.",
@@ -2610,6 +2828,7 @@ class RayPPOTrainer:
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
                 # TODO: make a canonical logger that supports various backend
+                self._dump_and_remove_copd_state_group_metrics(metrics)
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

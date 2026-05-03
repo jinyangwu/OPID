@@ -14,7 +14,27 @@
 # limitations under the License.
 
 from .memory import SimpleMemory, SearchMemory
-from .retrieval_memory import RetrievalMemory
 from .skills_only_memory import SkillsOnlyMemory
-from .skill_updater import SkillUpdater
 from .guide_memory import COPDGuideMemory
+
+
+def __getattr__(name):
+    if name == "RetrievalMemory":
+        from .retrieval_memory import RetrievalMemory
+
+        return RetrievalMemory
+    if name == "SkillUpdater":
+        from .skill_updater import SkillUpdater
+
+        return SkillUpdater
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "SimpleMemory",
+    "SearchMemory",
+    "SkillsOnlyMemory",
+    "COPDGuideMemory",
+    "RetrievalMemory",
+    "SkillUpdater",
+]

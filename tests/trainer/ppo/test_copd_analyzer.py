@@ -45,6 +45,24 @@ def test_copd_openai_prompt_uses_step_hints_as_selected_steps():
     assert "The chosen steps are exactly the keys present in step_hints" in user_prompt
     assert "Task description:" in user_prompt
     assert "find a red mug under 20 dollars" in user_prompt
+    assert "successful workflow" in user_prompt
+    assert "interpreted_outcome: success" in user_prompt
+
+
+def test_copd_prompt_for_failed_episode_emphasizes_avoidance():
+    analyzer = COPDEpisodeAnalyzer()
+
+    prompt = analyzer._build_episode_analysis_prompt(
+        steps=_sample_steps(),
+        candidate_step_indices=[0, 1],
+        episode_success=0.0,
+    )
+    user_prompt = prompt["messages"][0]["content"]
+
+    assert "why the trajectory failed" in user_prompt
+    assert "avoid that failure pattern" in user_prompt
+    assert "failed episode" in user_prompt
+    assert "interpreted_outcome: failure" in user_prompt
 
 
 def test_copd_parse_omits_legacy_selected_steps_field():

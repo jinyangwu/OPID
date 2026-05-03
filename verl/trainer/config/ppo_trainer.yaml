@@ -283,6 +283,8 @@ algorithm:
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/copd_analysis
     save_augmented_observations: True
     augmented_observation_dump_dir: null # null -> ${trainer.default_local_dir}/copd_augmented_observations
+    save_state_group_metrics: True
+    state_group_dump_dir: null # null -> ${trainer.default_local_dir}/copd_state_group
     normalize_teacher_adv: False
     clip_teacher_adv: null
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
@@ -329,19 +331,20 @@ env:
   history_length: 2
   guide_memory:
     enable: False
-    episode_enable: True
-    step_enable: True
-    episode_top_k: 1
-    step_top_k: 1
+    top_k: 2
+    max_per_skill_type: 1
+    similarity_threshold: 0.3
+    dedupe_skill_similarity_thresh: 0.88
+    enable_batch_task_aggregation: True
+    embedding_model_path: /raid3/data/GTPO/MODELS/Qwen3-Embedding-0.6B # falls back to hashing if unavailable
+    embedding_batch_size: 64
+    embedding_device: null # null -> sentence-transformers auto device
     promote_min_support: 2
-    merge_similarity_thresh: 0.9
-    state_similarity_thresh: 0.92
-    max_episode_guides_per_task: 8
-    max_step_guides_per_task: 24
+    merge_task_similarity_thresh: 0.85
+    merge_skill_similarity_thresh: 0.9
+    max_skills: 128
     max_task_chars: 256
-    max_state_chars: 384
-    max_episode_guide_chars: 256
-    max_step_guide_chars: 224
+    max_skill_chars: 256
     dump_dir: null # null -> ${trainer.default_local_dir}/guide_memory
     dump_freq_steps: 1
   resources_per_worker: # resources for each env worker
