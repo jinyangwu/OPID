@@ -345,6 +345,12 @@ env:
     max_skills: 128
     max_task_chars: 256
     max_skill_chars: 256
+    max_retrieval_chars: 768
+    max_evidence_examples: 8
+    max_embedding_cache_entries: 4096
+    aggregate_with_llm: True
+    aggregate_min_group_size: 2
+    aggregate_max_candidates: 8
     dump_dir: null # null -> ${trainer.default_local_dir}/guide_memory
     dump_freq_steps: 1
   resources_per_worker: # resources for each env worker

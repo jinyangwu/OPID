@@ -53,10 +53,16 @@ GUIDE_MERGE_TASK_SIMILARITY_THRESH=${GUIDE_MERGE_TASK_SIMILARITY_THRESH:-0.85}
 GUIDE_MERGE_SKILL_SIMILARITY_THRESH=${GUIDE_MERGE_SKILL_SIMILARITY_THRESH:-0.9}
 GUIDE_MAX_SKILLS=${GUIDE_MAX_SKILLS:-128}
 GUIDE_MAX_SKILL_CHARS=${GUIDE_MAX_SKILL_CHARS:-256}
+GUIDE_MAX_RETRIEVAL_CHARS=${GUIDE_MAX_RETRIEVAL_CHARS:-768}
+GUIDE_MAX_EVIDENCE_EXAMPLES=${GUIDE_MAX_EVIDENCE_EXAMPLES:-8}
+GUIDE_MAX_EMBEDDING_CACHE_ENTRIES=${GUIDE_MAX_EMBEDDING_CACHE_ENTRIES:-4096}
+GUIDE_AGGREGATE_WITH_LLM=${GUIDE_AGGREGATE_WITH_LLM:-True}
+GUIDE_AGGREGATE_MIN_GROUP_SIZE=${GUIDE_AGGREGATE_MIN_GROUP_SIZE:-2}
+GUIDE_AGGREGATE_MAX_CANDIDATES=${GUIDE_AGGREGATE_MAX_CANDIDATES:-8}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_webshop_llm-5_skills_opd-adv-0.001_start-10_exp1}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_webshop_llm-5_skills-gen_opd-adv-0.001_start-10_exp1}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -143,6 +149,12 @@ python3 -m verl.trainer.main_ppo \
     env.guide_memory.merge_skill_similarity_thresh=$GUIDE_MERGE_SKILL_SIMILARITY_THRESH \
     env.guide_memory.max_skills=$GUIDE_MAX_SKILLS \
     env.guide_memory.max_skill_chars=$GUIDE_MAX_SKILL_CHARS \
+    env.guide_memory.max_retrieval_chars=$GUIDE_MAX_RETRIEVAL_CHARS \
+    env.guide_memory.max_evidence_examples=$GUIDE_MAX_EVIDENCE_EXAMPLES \
+    env.guide_memory.max_embedding_cache_entries=$GUIDE_MAX_EMBEDDING_CACHE_ENTRIES \
+    env.guide_memory.aggregate_with_llm=$GUIDE_AGGREGATE_WITH_LLM \
+    env.guide_memory.aggregate_min_group_size=$GUIDE_AGGREGATE_MIN_GROUP_SIZE \
+    env.guide_memory.aggregate_max_candidates=$GUIDE_AGGREGATE_MAX_CANDIDATES \
     env.history_length=$history_length \
     env.env_name=Webshop \
     env.seed=0 \

@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,59 @@ def _stable_hash(parts: Iterable[str]) -> str:
         digest.update(str(part).encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _slugify_text(text: Any, *, max_chars: int = 64) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_")
+    return slug[:max_chars].strip("_") or "general_task"
+
+
+def _infer_task_pattern(task_text: Any) -> str:
+    task = _normalize_text(task_text, lowercase=True)
+    if not task:
+        return "general_task_execution"
+
+    if "clean" in task:
+        return "clean_object_workflow"
+    if "heat" in task:
+        return "heat_object_workflow"
+    if "cool" in task:
+        return "cool_object_workflow"
+    if "look at" in task and "under" in task:
+        return "look_at_object_in_light"
+    webshop_strong_terms = (
+        "dollar", "$", "price", "rating", "reviews", "buy", "purchase",
+        "amazon", "product", "shopping",
+    )
+    webshop_attribute_terms = (
+        "under", "over", "size", "color", "material", "brand",
+    )
+    webshop_category_terms = (
+        "shirt", "shoe", "mug", "laptop", "dress", "jacket", "cream",
+        "bottle", "bag", "book", "watch", "case",
+    )
+    if (
+        any(term in task for term in webshop_strong_terms)
+        or (
+            any(term in task for term in webshop_category_terms)
+            and any(term in task for term in webshop_attribute_terms)
+        )
+    ):
+        return "constrained_product_search"
+    if any(term in task for term in ("examine", "inspect", "find", "look")):
+        return "object_location_and_examination"
+    if any(term in task for term in ("search", "answer", "question", "respond")):
+        return "information_search"
+    return "general_task_execution"
+
+
+def _title_from_skill_text(skill_text: Any, skill_type: str) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", str(skill_text or ""))
+    if words:
+        title = " ".join(words[:5]).strip()
+    else:
+        title = _SKILL_TYPE_LABELS.get(skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE])
+    return title[:80]
 
 
 def _hashing_embedding(text: str, dim: int) -> List[float]:
@@ -188,16 +241,24 @@ def build_augmented_observation_text(
 @dataclass
 class GuideSkillRecord:
     skill_id: str
+    family_id: str
     task_text: str
     skill_text: str
     skill_type: str
-    task_embedding: List[float]
+    retrieval_text: str
     support_count: int
     status: str
     created_step: int
     last_updated_step: int
+    title: str = ""
+    task_pattern: str = ""
+    applicability_text: str = ""
+    success_count: int = 0
+    failure_count: int = 0
+    evidence_count: int = 0
     last_used_step: int = -1
     metadata: Dict[str, Any] = field(default_factory=dict)
+    evidence_examples: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -245,6 +306,12 @@ class COPDGuideMemory:
         self.max_skills = int(config.get("max_skills", 128))
         self.max_task_chars = int(config.get("max_task_chars", 256))
         self.max_skill_chars = int(config.get("max_skill_chars", 256))
+        self.max_retrieval_chars = int(config.get("max_retrieval_chars", 768))
+        self.max_evidence_examples = int(config.get("max_evidence_examples", 8))
+        self.max_embedding_cache_entries = int(config.get("max_embedding_cache_entries", 4096))
+        self.aggregate_with_llm = bool(config.get("aggregate_with_llm", False))
+        self.aggregate_min_group_size = max(int(config.get("aggregate_min_group_size", 2)), 1)
+        self.aggregate_max_candidates = max(int(config.get("aggregate_max_candidates", 8)), 1)
         self.dump_freq_steps = int(config.get("dump_freq_steps", 0))
 
         dump_dir = config.get("dump_dir", None)
@@ -256,6 +323,7 @@ class COPDGuideMemory:
             self.dump_dir = None
 
         self._skills: List[GuideSkillRecord] = []
+        self._text_embedding_cache: Dict[str, List[float]] = {}
         self._embedding_model = None
         self._embedding_backend = "hashing" if self.embedding_model_path.lower() in _HASHING_EMBEDDING_ALIASES else "model"
         self._embedding_fallback_warned = False
@@ -265,6 +333,116 @@ class COPDGuideMemory:
 
     def _normalize_skill_text(self, skill_text: Any) -> str:
         return _normalize_text(skill_text, lowercase=False, max_chars=self.max_skill_chars)
+
+    def _skill_family_id(self, task_pattern: str) -> str:
+        return _slugify_text(task_pattern, max_chars=64)
+
+    def _build_applicability_text(
+        self,
+        *,
+        task_text: str,
+        task_pattern: str,
+        skill_type: str,
+        explicit_applicability: Any = "",
+    ) -> str:
+        explicit = _normalize_text(explicit_applicability, lowercase=False, max_chars=240)
+        if explicit:
+            return explicit
+
+        label = _SKILL_TYPE_LABELS.get(skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE]).lower()
+        if task_pattern == "constrained_product_search":
+            return (
+                f"Use this {label} for shopping tasks that require finding a product while "
+                "satisfying hard constraints such as category, price, color, size, material, "
+                "brand, ratings, or other product attributes."
+            )
+        if task_pattern.endswith("_object_workflow") or task_pattern in {
+            "look_at_object_in_light",
+            "object_location_and_examination",
+        }:
+            return (
+                f"Use this {label} for embodied tasks that require locating objects, checking "
+                "the current room state, and sequencing navigation or object interactions safely."
+            )
+        if task_pattern == "information_search":
+            return (
+                f"Use this {label} for search or question-answering tasks where the agent must "
+                "gather evidence before responding."
+            )
+        return f"Use this {label} for tasks with a similar workflow or failure pattern."
+
+    def _build_retrieval_text(
+        self,
+        *,
+        family_id: str,
+        task_pattern: str,
+        skill_type: str,
+        title: str,
+        applicability_text: str,
+        skill_text: str,
+        task_text: str = "",
+    ) -> str:
+        parts = [
+            family_id,
+            task_pattern,
+            _SKILL_TYPE_LABELS.get(skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE]),
+            title,
+            applicability_text,
+            skill_text,
+        ]
+        if task_text:
+            parts.append(task_text)
+        return _normalize_text(" ".join(parts), lowercase=False, max_chars=self.max_retrieval_chars)
+
+    def _build_query_retrieval_text(self, task_text: str) -> str:
+        task_pattern = _infer_task_pattern(task_text)
+        family_id = self._skill_family_id(task_pattern)
+        return _normalize_text(
+            f"{family_id} {task_pattern} {task_text}",
+            lowercase=False,
+            max_chars=self.max_retrieval_chars,
+        )
+
+    def _build_skill_fields(
+        self,
+        *,
+        task_text: str,
+        skill_text: str,
+        skill_type: str,
+        title: Any = "",
+        task_pattern: Any = "",
+        applicability_text: Any = "",
+    ) -> Dict[str, str]:
+        normalized_task = _normalize_text(task_text, lowercase=False, max_chars=self.max_task_chars)
+        normalized_skill = self._normalize_skill_text(skill_text)
+        pattern = _normalize_text(task_pattern, lowercase=True, max_chars=96) or _infer_task_pattern(normalized_task)
+        family_id = self._skill_family_id(pattern)
+        normalized_title = _normalize_text(title, lowercase=False, max_chars=80) or _title_from_skill_text(
+            normalized_skill,
+            skill_type,
+        )
+        applicability = self._build_applicability_text(
+            task_text=normalized_task,
+            task_pattern=pattern,
+            skill_type=skill_type,
+            explicit_applicability=applicability_text,
+        )
+        retrieval_text = self._build_retrieval_text(
+            family_id=family_id,
+            task_pattern=pattern,
+            skill_type=skill_type,
+            title=normalized_title,
+            applicability_text=applicability,
+            skill_text=normalized_skill,
+            task_text=normalized_task,
+        )
+        return {
+            "family_id": family_id,
+            "task_pattern": pattern,
+            "title": normalized_title,
+            "applicability_text": applicability,
+            "retrieval_text": retrieval_text,
+        }
 
     def _skill_type_from_success(self, episode_success: Optional[float]) -> str:
         if episode_success is None:
@@ -276,6 +454,8 @@ class COPDGuideMemory:
 
     def _format_skill_for_prompt(self, record: GuideSkillRecord) -> str:
         label = _SKILL_TYPE_LABELS.get(record.skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE])
+        if record.applicability_text:
+            return f"{label}: {record.skill_text} Applies when: {record.applicability_text}"
         return f"{label}: {record.skill_text}"
 
     def _get_embedding_model(self):
@@ -306,8 +486,18 @@ class COPDGuideMemory:
             self._embedding_backend = "hashing"
             return None
 
-    def _embedding_key(self, task_text: Any) -> str:
-        return _normalize_text(task_text, lowercase=True, max_chars=self.max_task_chars)
+    def _embedding_key(self, text: Any) -> str:
+        return _normalize_text(text, lowercase=True, max_chars=self.max_retrieval_chars)
+
+    def _remember_embedding(self, key: str, embedding: Sequence[float]) -> None:
+        if not key or self.max_embedding_cache_entries <= 0:
+            return
+        if key in self._text_embedding_cache:
+            return
+        if len(self._text_embedding_cache) >= self.max_embedding_cache_entries:
+            oldest_key = next(iter(self._text_embedding_cache))
+            self._text_embedding_cache.pop(oldest_key, None)
+        self._text_embedding_cache[key] = [float(value) for value in embedding]
 
     def _embed_tasks(self, task_texts: Sequence[Any]) -> List[List[float]]:
         normalized_tasks = [
@@ -337,27 +527,31 @@ class COPDGuideMemory:
 
     def _embed_tasks_deduped(self, task_texts: Sequence[Any]) -> List[List[float]]:
         ordered_keys = [self._embedding_key(task_text) for task_text in task_texts]
+        empty_embedding = _hashing_embedding("", self.hash_embedding_dim)
+        embeddings_by_key = {
+            key: self._text_embedding_cache[key]
+            for key in ordered_keys
+            if key in self._text_embedding_cache
+        }
         unique_keys = []
         seen_keys = set()
         for key in ordered_keys:
-            if not key or key in seen_keys:
+            if not key or key in seen_keys or key in embeddings_by_key:
                 continue
             seen_keys.add(key)
             unique_keys.append(key)
 
         unique_embeddings = self._embed_tasks(unique_keys) if unique_keys else []
-        embeddings_by_key = {
-            key: embedding
-            for key, embedding in zip(unique_keys, unique_embeddings)
-        }
-        empty_embedding = _hashing_embedding("", self.hash_embedding_dim)
+        for key, embedding in zip(unique_keys, unique_embeddings):
+            embeddings_by_key[key] = embedding
+            self._remember_embedding(key, embedding)
         return [
             embeddings_by_key.get(key, empty_embedding)
             for key in ordered_keys
         ]
 
     def _embed_task(self, task_text: str) -> List[float]:
-        embeddings = self._embed_tasks([task_text])
+        embeddings = self._embed_tasks_deduped([task_text])
         return embeddings[0] if embeddings else _hashing_embedding("", self.hash_embedding_dim)
 
     def _is_promoted(self, record: GuideSkillRecord) -> bool:
@@ -375,18 +569,33 @@ class COPDGuideMemory:
     def _match_skill_record(
         self,
         *,
-        task_embedding: Sequence[float],
+        retrieval_embedding: Sequence[float],
         skill_text: str,
         skill_type: str,
+        family_id: str,
+        task_text: str,
     ) -> Optional[GuideSkillRecord]:
-        for record in self._skills:
+        record_embeddings = self._embed_tasks_deduped(
+            [record.retrieval_text for record in self._skills]
+        )
+        task_key = _normalize_text(task_text, lowercase=True, max_chars=self.max_task_chars)
+        for record, record_embedding in zip(self._skills, record_embeddings):
             if record.skill_type != skill_type:
                 continue
-            task_similarity = _cosine_similarity(task_embedding, record.task_embedding)
+            if (
+                task_key
+                and task_key == _normalize_text(record.task_text, lowercase=True, max_chars=self.max_task_chars)
+                and record.family_id == family_id
+            ):
+                return record
+            retrieval_similarity = _cosine_similarity(retrieval_embedding, record_embedding)
             skill_similarity = _text_similarity(record.skill_text, skill_text)
             if (
-                task_similarity >= self.merge_task_similarity_thresh
-                and skill_similarity >= self.merge_skill_similarity_thresh
+                retrieval_similarity >= self.merge_task_similarity_thresh
+                and (
+                    record.family_id == family_id
+                    or skill_similarity >= self.merge_skill_similarity_thresh
+                )
             ):
                 return record
         return None
@@ -411,10 +620,16 @@ class COPDGuideMemory:
         task_text: str,
         skill_text: str,
         skill_type: str,
+        family_id: str,
+        title: str,
+        task_pattern: str,
+        applicability_text: str,
+        retrieval_text: str,
         global_step: int,
         source: str,
         support_increment: int = 1,
-        task_embedding: Optional[Sequence[float]] = None,
+        retrieval_embedding: Optional[Sequence[float]] = None,
+        evidence_examples: Optional[Sequence[Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, bool]:
         normalized_task = _normalize_text(task_text, lowercase=False, max_chars=self.max_task_chars)
@@ -422,38 +637,71 @@ class COPDGuideMemory:
         if not normalized_task or not normalized_skill:
             return False, False
 
-        if task_embedding is None:
-            task_embedding = self._embed_task(normalized_task)
+        if retrieval_embedding is None:
+            retrieval_embedding = self._embed_task(retrieval_text)
         else:
-            task_embedding = [float(value) for value in task_embedding]
+            retrieval_embedding = [float(value) for value in retrieval_embedding]
         record = self._match_skill_record(
-            task_embedding=task_embedding,
+            retrieval_embedding=retrieval_embedding,
             skill_text=normalized_skill,
             skill_type=skill_type,
+            family_id=family_id,
+            task_text=normalized_task,
         )
         merged = record is not None
         if record is None:
             record = GuideSkillRecord(
                 skill_id=f"skill_{uuid.uuid4().hex[:12]}",
+                family_id=family_id,
                 task_text=normalized_task,
                 skill_text=normalized_skill,
                 skill_type=skill_type,
-                task_embedding=task_embedding,
+                retrieval_text=retrieval_text,
                 support_count=0,
                 status="pending",
                 created_step=global_step,
                 last_updated_step=global_step,
+                title=title,
+                task_pattern=task_pattern,
+                applicability_text=applicability_text,
                 metadata={},
             )
             self._skills.append(record)
+        else:
+            if len(normalized_skill) > len(record.skill_text):
+                record.skill_text = normalized_skill
+                record.title = title or record.title
+                record.task_text = normalized_task
+            if applicability_text and len(applicability_text) > len(record.applicability_text):
+                record.applicability_text = applicability_text
+            record.retrieval_text = self._build_retrieval_text(
+                family_id=record.family_id,
+                task_pattern=record.task_pattern or task_pattern,
+                skill_type=record.skill_type,
+                title=record.title or title,
+                applicability_text=record.applicability_text or applicability_text,
+                skill_text=record.skill_text,
+                task_text=record.task_text,
+            )
 
         record.support_count += max(int(support_increment), 1)
+        if skill_type == SUCCESS_WORKFLOW:
+            record.success_count += max(int(support_increment), 1)
+        elif skill_type == FAILURE_AVOIDANCE:
+            record.failure_count += max(int(support_increment), 1)
         record.last_updated_step = global_step
+        incoming_evidence = list(evidence_examples or [])
+        if incoming_evidence:
+            record.evidence_examples.extend(incoming_evidence)
+            record.evidence_examples = record.evidence_examples[-self.max_evidence_examples:]
+            record.evidence_count += len(incoming_evidence)
         record.metadata.update(
             {
                 "source": source,
                 "last_task_hash": _stable_hash([normalized_task])[:12],
                 "skill_type": skill_type,
+                "family_id": record.family_id,
+                "task_pattern": record.task_pattern,
             }
         )
         if metadata:
@@ -465,6 +713,10 @@ class COPDGuideMemory:
     def _cluster_batch_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
+        *,
+        skill_aggregator: Optional[Callable[..., Dict[str, Any]]] = None,
+        global_step: Optional[int] = None,
+        analysis_mode: str = "teacher_bootstrap",
     ) -> List[Dict[str, Any]]:
         if not self.enable_batch_task_aggregation:
             return [
@@ -472,6 +724,9 @@ class COPDGuideMemory:
                     "task_text": candidate["task_text"],
                     "skill_text": candidate["skill_text"],
                     "skill_type": candidate["skill_type"],
+                    "title": candidate.get("title", ""),
+                    "task_pattern": candidate.get("task_pattern", ""),
+                    "applicability_text": candidate.get("applicability_text", ""),
                     "support_increment": 1,
                     "traj_uids": [str(candidate["traj_uid"])],
                     "episode_success_values": (
@@ -480,6 +735,7 @@ class COPDGuideMemory:
                         else []
                     ),
                     "step_hint_count": int(candidate["step_hint_count"]),
+                    "candidate_hints": [candidate["skill_text"]],
                 }
                 for candidate in candidates
             ]
@@ -491,38 +747,83 @@ class COPDGuideMemory:
 
         clustered: List[Dict[str, Any]] = []
         for (_, skill_type), group in grouped_candidates.items():
-            clusters: List[List[Dict[str, Any]]] = []
-            for candidate in group:
-                placed = False
-                for cluster in clusters:
-                    representative = cluster[0]
-                    if _text_similarity(candidate["skill_text"], representative["skill_text"]) >= self.dedupe_skill_similarity_thresh:
-                        cluster.append(candidate)
-                        placed = True
-                        break
-                if not placed:
-                    clusters.append([candidate])
-
-            for cluster in clusters:
-                representative = max(
-                    cluster,
-                    key=lambda item: (len(item["skill_text"]), item["traj_uid"]),
-                )
-                clustered.append(
-                    {
-                        "task_text": representative["task_text"],
-                        "skill_text": representative["skill_text"],
-                        "skill_type": skill_type,
-                        "support_increment": len(cluster),
-                        "traj_uids": [str(item["traj_uid"]) for item in cluster],
-                        "episode_success_values": [
+            representative = max(
+                group,
+                key=lambda item: (len(item["skill_text"]), item["traj_uid"]),
+            )
+            candidate_hints = [
+                item["skill_text"]
+                for item in group[: min(len(group), self.aggregate_max_candidates)]
+            ]
+            aggregated_fields: Dict[str, Any] = {}
+            aggregation_used = False
+            aggregation_error = ""
+            if (
+                self.aggregate_with_llm
+                and skill_aggregator is not None
+                and len(group) >= self.aggregate_min_group_size
+                and candidate_hints
+            ):
+                try:
+                    aggregated_fields = skill_aggregator(
+                        task_text=representative["task_text"],
+                        skill_type=skill_type,
+                        candidate_hints=candidate_hints,
+                        episode_success_values=[
                             item["episode_success"]
-                            for item in cluster
+                            for item in group
                             if item["episode_success"] is not None
                         ],
-                        "step_hint_count": sum(int(item["step_hint_count"]) for item in cluster),
-                    }
-                )
+                        global_step=global_step,
+                        analysis_mode=analysis_mode,
+                    ) or {}
+                    aggregation_used = bool(
+                        str(aggregated_fields.get("skill_text") or "").strip()
+                    )
+                    if not aggregation_used:
+                        aggregated_fields = {}
+                except Exception as exc:  # pragma: no cover - runtime backend dependent
+                    aggregation_error = str(exc)
+                    logger.warning(
+                        "Guide memory LLM skill aggregation failed for task=%s type=%s: %s",
+                        representative["task_text"],
+                        skill_type,
+                        exc,
+                    )
+
+            aggregated_skill_text = self._normalize_skill_text(
+                aggregated_fields.get("skill_text")
+                or representative["skill_text"]
+            )
+            aggregated_title = aggregated_fields.get("title") or representative.get("title", "")
+            aggregated_task_pattern = aggregated_fields.get("task_pattern") or representative.get("task_pattern", "")
+            aggregated_applicability = (
+                aggregated_fields.get("applicability_text")
+                or aggregated_fields.get("when_to_apply")
+                or representative.get("applicability_text", "")
+            )
+            clustered.append(
+                {
+                    "task_text": representative["task_text"],
+                    "skill_text": aggregated_skill_text,
+                    "skill_type": skill_type,
+                    "title": aggregated_title,
+                    "task_pattern": aggregated_task_pattern,
+                    "applicability_text": aggregated_applicability,
+                    "support_increment": len(group),
+                    "traj_uids": [str(item["traj_uid"]) for item in group],
+                    "episode_success_values": [
+                        item["episode_success"]
+                        for item in group
+                        if item["episode_success"] is not None
+                    ],
+                    "step_hint_count": sum(int(item["step_hint_count"]) for item in group),
+                    "candidate_hints": candidate_hints,
+                    "aggregation_used": aggregation_used,
+                    "aggregation_error": aggregation_error,
+                    "aggregation_raw": aggregated_fields.get("raw_output", ""),
+                }
+            )
 
         return clustered
 
@@ -545,10 +846,14 @@ class COPDGuideMemory:
 
         threshold = self.similarity_threshold if similarity_threshold is None else float(similarity_threshold)
         scored_records = []
-        for record in self._skills:
+        active_records = [record for record in self._skills if record.status == "active"]
+        active_embeddings = self._embed_tasks_deduped(
+            [record.retrieval_text for record in active_records]
+        )
+        for record, record_embedding in zip(active_records, active_embeddings):
             if record.status != "active":
                 continue
-            similarity = _cosine_similarity(query_embedding, record.task_embedding)
+            similarity = _cosine_similarity(query_embedding, record_embedding)
             if similarity < threshold:
                 continue
             scored_records.append((similarity, record))
@@ -574,9 +879,13 @@ class COPDGuideMemory:
             skill_records.append(
                 {
                     "skill_id": record.skill_id,
+                    "family_id": record.family_id,
                     "task_text": record.task_text,
                     "skill_text": record.skill_text,
                     "skill_type": record.skill_type,
+                    "title": record.title,
+                    "task_pattern": record.task_pattern,
+                    "applicability_text": record.applicability_text,
                     "similarity": float(similarity),
                     "support_count": int(record.support_count),
                 }
@@ -602,7 +911,8 @@ class COPDGuideMemory:
                 "skills": [],
                 "skill_records": [],
             }
-        query_embedding = self._embed_task(task_text)
+        query_retrieval_text = self._build_query_retrieval_text(task_text)
+        query_embedding = self._embed_task(query_retrieval_text)
         return self._retrieve_guides_from_embedding(
             task_text=task_text,
             query_embedding=query_embedding,
@@ -643,8 +953,11 @@ class COPDGuideMemory:
         if not valid_positions:
             return results
 
-        valid_task_texts = [task_texts[idx] for idx in valid_positions]
-        embeddings = self._embed_tasks_deduped(valid_task_texts)
+        valid_query_texts = [
+            self._build_query_retrieval_text(task_texts[idx])
+            for idx in valid_positions
+        ]
+        embeddings = self._embed_tasks_deduped(valid_query_texts)
         for idx, embedding in zip(valid_positions, embeddings):
             results[idx] = self._retrieve_guides_from_embedding(
                 task_text=task_texts[idx],
@@ -747,6 +1060,7 @@ class COPDGuideMemory:
         global_step: int,
         episode_success: Optional[Sequence[float]] = None,
         analysis_mode: str = "teacher_bootstrap",
+        skill_aggregator: Optional[Callable[..., Dict[str, Any]]] = None,
     ) -> Dict[str, float]:
         del anchor_obs, critical_mask
         metrics = {
@@ -755,6 +1069,8 @@ class COPDGuideMemory:
             "copd/guide_memory/skill_candidates_merged": 0.0,
             "copd/guide_memory/batch_candidate_count": 0.0,
             "copd/guide_memory/batch_cluster_count": 0.0,
+            "copd/guide_memory/batch_llm_aggregation_count": 0.0,
+            "copd/guide_memory/batch_llm_aggregation_error_count": 0.0,
         }
         if not self.enabled:
             return metrics
@@ -797,33 +1113,78 @@ class COPDGuideMemory:
                     "task_text": task_text,
                     "skill_text": self._normalize_skill_text(skill_text),
                     "skill_type": self._skill_type_from_success(episode_success_value),
+                    "title": analysis.get("skill_title") or analysis.get("title") or "",
+                    "task_pattern": analysis.get("task_pattern") or "",
+                    "applicability_text": analysis.get("applicability_text") or analysis.get("when_to_apply") or "",
                     "episode_success": episode_success_value,
+                    "episode_summary": str(analysis.get("episode_summary", "")),
                     "step_hint_count": len(analysis.get("step_hints", {}) or {}),
                 }
             )
 
-        clustered_candidates = self._cluster_batch_candidates(candidates)
+        clustered_candidates = self._cluster_batch_candidates(
+            candidates,
+            skill_aggregator=skill_aggregator,
+            global_step=global_step,
+            analysis_mode=analysis_mode,
+        )
         metrics["copd/guide_memory/batch_candidate_count"] = float(len(candidates))
         metrics["copd/guide_memory/batch_cluster_count"] = float(len(clustered_candidates))
-
-        candidate_embeddings = self._embed_tasks_deduped(
-            [candidate["task_text"] for candidate in clustered_candidates]
+        metrics["copd/guide_memory/batch_llm_aggregation_count"] = float(
+            sum(1 for candidate in clustered_candidates if candidate.get("aggregation_used"))
         )
-        for candidate, task_embedding in zip(clustered_candidates, candidate_embeddings):
+        metrics["copd/guide_memory/batch_llm_aggregation_error_count"] = float(
+            sum(1 for candidate in clustered_candidates if candidate.get("aggregation_error"))
+        )
+
+        skill_fields = [
+            self._build_skill_fields(
+                task_text=candidate["task_text"],
+                skill_text=candidate["skill_text"],
+                skill_type=candidate["skill_type"],
+                title=candidate.get("title", ""),
+                task_pattern=candidate.get("task_pattern", ""),
+                applicability_text=candidate.get("applicability_text", ""),
+            )
+            for candidate in clustered_candidates
+        ]
+        candidate_embeddings = self._embed_tasks_deduped(
+            [fields["retrieval_text"] for fields in skill_fields]
+        )
+        for candidate, fields, retrieval_embedding in zip(clustered_candidates, skill_fields, candidate_embeddings):
+            evidence_examples = [
+                {
+                    "task_text": candidate["task_text"],
+                    "traj_uids": candidate.get("traj_uids", []),
+                    "episode_success_values": candidate.get("episode_success_values", []),
+                    "skill_text": candidate["skill_text"],
+                    "global_step": int(global_step),
+                }
+            ]
             added, merged = self._add_skill(
                 task_text=candidate["task_text"],
                 skill_text=candidate["skill_text"],
                 skill_type=candidate["skill_type"],
+                family_id=fields["family_id"],
+                title=fields["title"],
+                task_pattern=fields["task_pattern"],
+                applicability_text=fields["applicability_text"],
+                retrieval_text=fields["retrieval_text"],
                 global_step=global_step,
                 source=f"{analysis_mode}/episode_hint",
                 support_increment=int(candidate.get("support_increment", 1)),
-                task_embedding=task_embedding,
+                retrieval_embedding=retrieval_embedding,
+                evidence_examples=evidence_examples,
                 metadata={
                     "traj_uids": candidate.get("traj_uids", []),
                     "analysis_mode": analysis_mode,
                     "episode_success_values": candidate.get("episode_success_values", []),
                     "step_hint_count": int(candidate.get("step_hint_count", 0)),
                     "batch_support_increment": int(candidate.get("support_increment", 1)),
+                    "candidate_hints": candidate.get("candidate_hints", []),
+                    "aggregation_used": bool(candidate.get("aggregation_used", False)),
+                    "aggregation_error": str(candidate.get("aggregation_error", "")),
+                    "aggregation_raw": str(candidate.get("aggregation_raw", "")),
                 },
             )
             metrics["copd/guide_memory/skill_candidates_added"] += float(added)
@@ -842,14 +1203,20 @@ class COPDGuideMemory:
 
         support_values = [record.support_count for record in self._skills]
         mean_support = float(sum(support_values) / len(support_values)) if support_values else 0.0
+        family_count = len({record.family_id for record in self._skills if record.family_id})
+        evidence_total = sum(int(record.evidence_count) for record in self._skills)
         return {
             f"{prefix}/skill_total": float(len(self._skills)),
             f"{prefix}/skill_active": _count_status("active"),
             f"{prefix}/skill_pending": _count_status("pending"),
+            f"{prefix}/skill_family_total": float(family_count),
             f"{prefix}/skill_success_workflow": _count_type(SUCCESS_WORKFLOW),
             f"{prefix}/skill_failure_avoidance": _count_type(FAILURE_AVOIDANCE),
             f"{prefix}/skill_unknown": _count_type(UNKNOWN_SKILL_TYPE),
             f"{prefix}/skill_mean_support": mean_support,
+            f"{prefix}/skill_evidence_total": float(evidence_total),
+            f"{prefix}/embedding_cache_entries": float(len(self._text_embedding_cache)),
+            f"{prefix}/aggregate_with_llm": 1.0 if self.aggregate_with_llm else 0.0,
         }
 
     def dump_snapshot(self, path: str) -> None:

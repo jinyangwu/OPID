@@ -1882,6 +1882,10 @@ class RayPPOTrainer:
             return
 
         episode_success = batch.non_tensor_batch.get("episode_success")
+        skill_aggregator = None
+        if bool(getattr(guide_memory, "aggregate_with_llm", False)):
+            analyzer = self._lazy_init_copd_analyzer()
+            skill_aggregator = getattr(analyzer, "aggregate_guide_skill_candidates", None)
 
         guide_metrics = guide_memory.update_from_episode_analysis(
             obs_texts=batch.non_tensor_batch.get("obs_text_base", batch.non_tensor_batch["obs_text"]),
@@ -1893,6 +1897,7 @@ class RayPPOTrainer:
             global_step=self.global_steps,
             episode_success=episode_success,
             analysis_mode=analysis_mode,
+            skill_aggregator=skill_aggregator,
         )
         metrics.update(guide_metrics)
 

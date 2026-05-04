@@ -1,4 +1,8 @@
-from agent_system.memory.guide_memory import COPDGuideMemory, build_augmented_observation_text
+from agent_system.memory.guide_memory import (
+    COPDGuideMemory,
+    _infer_task_pattern,
+    build_augmented_observation_text,
+)
 
 
 PROMPT = """
@@ -10,24 +14,24 @@ Now it's your turn to take one action for the current step.
 """.strip()
 
 
-def _make_memory(promote_min_support=1):
-    return COPDGuideMemory(
-        {
-            "enable": True,
-            "top_k": 2,
-            "max_per_skill_type": 1,
-            "similarity_threshold": 0.2,
-            "dedupe_skill_similarity_thresh": 0.88,
-            "enable_batch_task_aggregation": True,
-            "embedding_model_path": "hashing",
-            "embedding_batch_size": 4,
-            "promote_min_support": promote_min_support,
-            "merge_task_similarity_thresh": 0.5,
-            "merge_skill_similarity_thresh": 0.8,
-            "max_skills": 8,
-            "max_skill_chars": 256,
-        }
-    )
+def _make_memory(promote_min_support=1, **overrides):
+    config = {
+        "enable": True,
+        "top_k": 2,
+        "max_per_skill_type": 1,
+        "similarity_threshold": 0.2,
+        "dedupe_skill_similarity_thresh": 0.88,
+        "enable_batch_task_aggregation": True,
+        "embedding_model_path": "hashing",
+        "embedding_batch_size": 4,
+        "promote_min_support": promote_min_support,
+        "merge_task_similarity_thresh": 0.5,
+        "merge_skill_similarity_thresh": 0.8,
+        "max_skills": 8,
+        "max_skill_chars": 256,
+    }
+    config.update(overrides)
+    return COPDGuideMemory(config)
 
 
 def _update_once(memory, *, task_prompt=PROMPT, global_step=1):
@@ -77,9 +81,10 @@ def test_pending_skill_is_not_retrieved_until_promoted():
     assert metrics["copd/guide_memory/skill_candidates_merged"] == 1.0
     assert len(memory._skills) == 1
     assert memory._skills[0].status == "active"
-    assert second_retrieval["skills"] == [
+    assert len(second_retrieval["skills"]) == 1
+    assert second_retrieval["skills"][0].startswith(
         "Failure avoidance: Search with the key product attributes before clicking an item."
-    ]
+    )
 
 
 def test_semantic_task_retrieval_filters_by_similarity():
@@ -95,10 +100,17 @@ def test_semantic_task_retrieval_filters_by_similarity():
         global_step=3,
     )
 
-    assert similar["skills"] == [
+    assert len(similar["skills"]) == 1
+    assert similar["skills"][0].startswith(
         "Failure avoidance: Search with the key product attributes before clicking an item."
-    ]
+    )
     assert unrelated["skills"] == []
+
+
+def test_task_pattern_keeps_shopping_and_embodied_find_tasks_separate():
+    assert _infer_task_pattern("find a red mug under 20 dollars") == "constrained_product_search"
+    assert _infer_task_pattern("find the mug in the kitchen") == "object_location_and_examination"
+    assert _infer_task_pattern("look at the bowl under the desklamp") == "look_at_object_in_light"
 
 
 def test_same_batch_same_task_candidates_are_aggregated_before_storage():
@@ -131,6 +143,57 @@ def test_same_batch_same_task_candidates_are_aggregated_before_storage():
     assert len(memory._skills) == 1
     assert memory._skills[0].support_count == 2
     assert memory._skills[0].status == "active"
+
+
+def test_same_batch_candidates_can_be_synthesized_by_llm_aggregator():
+    memory = _make_memory(
+        promote_min_support=2,
+        aggregate_with_llm=True,
+        aggregate_min_group_size=2,
+    )
+    aggregator_calls = []
+
+    def fake_aggregator(**kwargs):
+        aggregator_calls.append(kwargs)
+        return {
+            "title": "Verify product constraints",
+            "task_pattern": "constrained_product_search",
+            "applicability_text": "Use for shopping tasks with hard product constraints.",
+            "skill_text": "Verify the product category, color, and price before selecting or buying an item.",
+        }
+
+    metrics = memory.update_from_episode_analysis(
+        obs_texts=[PROMPT, PROMPT],
+        anchor_obs=["Search page.", "Search page."],
+        traj_uids=["traj-1", "traj-2"],
+        step_indices=[0, 0],
+        critical_mask=[True, True],
+        episode_analysis={
+            "traj-1": {
+                "episode_hint": "Avoid clicking before checking that the item is red and below the price limit.",
+            },
+            "traj-2": {
+                "episode_hint": "Avoid buying until the product page confirms color, price, and item type.",
+            },
+        },
+        global_step=1,
+        episode_success=[0.0, 0.0],
+        analysis_mode="teacher_bootstrap",
+        skill_aggregator=fake_aggregator,
+    )
+
+    assert len(aggregator_calls) == 1
+    assert aggregator_calls[0]["skill_type"] == "failure_avoidance"
+    assert len(aggregator_calls[0]["candidate_hints"]) == 2
+    assert metrics["copd/guide_memory/batch_llm_aggregation_count"] == 1.0
+    assert metrics["copd/guide_memory/batch_llm_aggregation_error_count"] == 0.0
+    assert len(memory._skills) == 1
+    assert memory._skills[0].support_count == 2
+    assert memory._skills[0].skill_text == (
+        "Verify the product category, color, and price before selecting or buying an item."
+    )
+    assert memory._skills[0].metadata["aggregation_used"] is True
+    assert len(memory._skills[0].metadata["candidate_hints"]) == 2
 
 
 def test_retrieval_returns_one_success_and_one_failure_skill_for_same_task():
@@ -190,7 +253,8 @@ def test_retrieval_caps_redundant_same_type_skills_for_same_task():
 
     retrieval = memory.retrieve_for_observation(observation=PROMPT, global_step=2)
 
-    assert len(memory._skills) == 2
+    assert len(memory._skills) == 1
+    assert memory._skills[0].support_count == 2
     assert len(retrieval["skills"]) == 1
     assert retrieval["skills"][0].startswith("Failure avoidance:")
 
@@ -215,7 +279,30 @@ def test_batch_retrieval_deduplicates_identical_task_queries():
 
     assert len(retrievals) == 2
     assert all(retrieval["skills"] for retrieval in retrievals)
-    assert embed_calls == [["find a red mug under 20 dollars"]]
+    assert len(embed_calls) == 1
+    assert "find a red mug under 20 dollars" in embed_calls[0][0]
+
+
+def test_skill_snapshot_does_not_persist_embeddings():
+    import json
+    import os
+    import tempfile
+
+    memory = _make_memory()
+    _update_once(memory)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        snapshot_path = os.path.join(tmp_dir, "guide_memory.json")
+        memory.dump_snapshot(snapshot_path)
+
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    assert payload["skills"]
+    serialized_skill = payload["skills"][0]
+    assert "task_embedding" not in serialized_skill
+    assert "retrieval_embedding" not in serialized_skill
+    assert "retrieval_text" in serialized_skill
+    assert "evidence_examples" in serialized_skill
 
 
 def test_augmented_observation_injects_skills_and_step_hint():
