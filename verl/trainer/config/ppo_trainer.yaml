@@ -264,6 +264,7 @@ algorithm:
     phase_switch_after_steps: null
     use_with_memory_after_phase_switch: False
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
+    enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
     similarity_thresh: 0.95
     selector: "llm" # "stats" or "llm"
@@ -341,16 +342,12 @@ env:
     embedding_device: null # null -> sentence-transformers auto device
     promote_min_support: 2
     merge_task_similarity_thresh: 0.85
-    merge_skill_similarity_thresh: 0.9
     max_skills: 128
     max_task_chars: 256
     max_skill_chars: 256
     max_retrieval_chars: 768
-    max_evidence_examples: 8
     max_embedding_cache_entries: 4096
-    aggregate_with_llm: True
-    aggregate_min_group_size: 2
-    aggregate_max_candidates: 8
+    batch_cluster_similarity_thresh: 0.85
     dump_dir: null # null -> ${trainer.default_local_dir}/guide_memory
     dump_freq_steps: 1
   resources_per_worker: # resources for each env worker
@@ -376,5 +373,5 @@ env:
   sciworld:
     generalization_level: 0
     simplifications_preset: easy
-    env_step_limit: 100
+    env_step_limit: 50
     jar_path: null

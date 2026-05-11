@@ -18,7 +18,7 @@ NUM_CPUS_PER_ENV_WORKER=0.1
 COPD_MODE=mean_norm
 COPD_STEP_ADV_W=0.0
 COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-0.001}
-COPD_OPD_START_AFTER_STEPS=${COPD_OPD_START_AFTER_STEPS:-10}
+COPD_OPD_START_AFTER_STEPS=${COPD_OPD_START_AFTER_STEPS:-20}
 COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-null}
 
 # COPD episode filtering and teacher prompt construction.
@@ -28,6 +28,7 @@ COPD_FAILURE_SUCCESS_THRESHOLD=${COPD_FAILURE_SUCCESS_THRESHOLD:-1.0}
 COPD_ENHANCE_STEP_HINT_ONLY=${COPD_ENHANCE_STEP_HINT_ONLY:-False}
 
 # COPD critical-step selection and analysis.
+COPD_ENABLE_ANALYSIS=${COPD_ENABLE_ANALYSIS:-True}
 COPD_SELECTOR=${COPD_SELECTOR:-llm}
 COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
@@ -47,22 +48,18 @@ GUIDE_DEDUPE_SKILL_SIMILARITY_THRESH=${GUIDE_DEDUPE_SKILL_SIMILARITY_THRESH:-0.8
 GUIDE_ENABLE_BATCH_TASK_AGGREGATION=${GUIDE_ENABLE_BATCH_TASK_AGGREGATION:-True}
 GUIDE_EMBEDDING_MODEL_PATH=${GUIDE_EMBEDDING_MODEL_PATH:-/raid3/data/GTPO/MODELS/Qwen3-Embedding-0.6B}
 GUIDE_EMBEDDING_BATCH_SIZE=${GUIDE_EMBEDDING_BATCH_SIZE:-64}
-GUIDE_EMBEDDING_DEVICE=${GUIDE_EMBEDDING_DEVICE:-null}
+GUIDE_EMBEDDING_DEVICE=${GUIDE_EMBEDDING_DEVICE:-cuda:0}
 GUIDE_PROMOTE_MIN_SUPPORT=${GUIDE_PROMOTE_MIN_SUPPORT:-1}
 GUIDE_MERGE_TASK_SIMILARITY_THRESH=${GUIDE_MERGE_TASK_SIMILARITY_THRESH:-0.85}
-GUIDE_MERGE_SKILL_SIMILARITY_THRESH=${GUIDE_MERGE_SKILL_SIMILARITY_THRESH:-0.9}
 GUIDE_MAX_SKILLS=${GUIDE_MAX_SKILLS:-128}
 GUIDE_MAX_SKILL_CHARS=${GUIDE_MAX_SKILL_CHARS:-256}
 GUIDE_MAX_RETRIEVAL_CHARS=${GUIDE_MAX_RETRIEVAL_CHARS:-768}
-GUIDE_MAX_EVIDENCE_EXAMPLES=${GUIDE_MAX_EVIDENCE_EXAMPLES:-8}
 GUIDE_MAX_EMBEDDING_CACHE_ENTRIES=${GUIDE_MAX_EMBEDDING_CACHE_ENTRIES:-4096}
-GUIDE_AGGREGATE_WITH_LLM=${GUIDE_AGGREGATE_WITH_LLM:-True}
-GUIDE_AGGREGATE_MIN_GROUP_SIZE=${GUIDE_AGGREGATE_MIN_GROUP_SIZE:-2}
-GUIDE_AGGREGATE_MAX_CANDIDATES=${GUIDE_AGGREGATE_MAX_CANDIDATES:-8}
+GUIDE_BATCH_CLUSTER_SIMILARITY_THRESH=${GUIDE_BATCH_CLUSTER_SIMILARITY_THRESH:-0.85}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_webshop_llm-5_skills-gen_opd-adv-0.001_start-10_exp1}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_webshop_llm-5_skills-gen_opd-adv-0.001_start-30_exp4}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -121,6 +118,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.failure_success_threshold=$COPD_FAILURE_SUCCESS_THRESHOLD \
     algorithm.copd.enhance_step_hint_only=$COPD_ENHANCE_STEP_HINT_ONLY \
     algorithm.copd.mode=$COPD_MODE \
+    algorithm.copd.enable_analysis=$COPD_ENABLE_ANALYSIS \
     algorithm.copd.selector=$COPD_SELECTOR \
     algorithm.copd.enable_similarity=False \
     algorithm.copd.similarity_thresh=$COPD_SIMILARITY_THRESH \
@@ -146,15 +144,11 @@ python3 -m verl.trainer.main_ppo \
     env.guide_memory.embedding_device=$GUIDE_EMBEDDING_DEVICE \
     env.guide_memory.promote_min_support=$GUIDE_PROMOTE_MIN_SUPPORT \
     env.guide_memory.merge_task_similarity_thresh=$GUIDE_MERGE_TASK_SIMILARITY_THRESH \
-    env.guide_memory.merge_skill_similarity_thresh=$GUIDE_MERGE_SKILL_SIMILARITY_THRESH \
     env.guide_memory.max_skills=$GUIDE_MAX_SKILLS \
     env.guide_memory.max_skill_chars=$GUIDE_MAX_SKILL_CHARS \
     env.guide_memory.max_retrieval_chars=$GUIDE_MAX_RETRIEVAL_CHARS \
-    env.guide_memory.max_evidence_examples=$GUIDE_MAX_EVIDENCE_EXAMPLES \
     env.guide_memory.max_embedding_cache_entries=$GUIDE_MAX_EMBEDDING_CACHE_ENTRIES \
-    env.guide_memory.aggregate_with_llm=$GUIDE_AGGREGATE_WITH_LLM \
-    env.guide_memory.aggregate_min_group_size=$GUIDE_AGGREGATE_MIN_GROUP_SIZE \
-    env.guide_memory.aggregate_max_candidates=$GUIDE_AGGREGATE_MAX_CANDIDATES \
+    env.guide_memory.batch_cluster_similarity_thresh=$GUIDE_BATCH_CLUSTER_SIMILARITY_THRESH \
     env.history_length=$history_length \
     env.env_name=Webshop \
     env.seed=0 \

@@ -335,11 +335,19 @@ class TrajectoryCollector:
             success_rate[key] = np.mean(value)
         
         effective_batch = []
+        rollout_group_size = int(self.config.env.rollout.n) if self.config.env.rollout.n > 0 else 1
         for bs in range(batch_size):
+            sample_id = bs // rollout_group_size
+            rollout_id = bs % rollout_group_size
             # sum the rewards for each data in total_batch_list[bs]
-            for data in total_batch_list[bs]:
+            for step_position, data in enumerate(total_batch_list[bs]):
                 assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
                 if data['active_masks']:
+                    step_num = int(data.get('step_num', step_position))
+                    data['sample_id'] = sample_id
+                    data['rollout_id'] = rollout_id
+                    data['step_num'] = step_num
+                    data['step_id'] = f"{sample_id}_{rollout_id}_{step_num}"
                     # episode_rewards
                     data['episode_rewards'] = episode_rewards[bs]
                     # episode_lengths
@@ -397,6 +405,15 @@ class TrajectoryCollector:
         else: # no env grouping, set all to the same uid
             uid = str(uuid.uuid4())
             uid_batch = np.array([uid for _ in range(len(gen_batch.batch))], dtype=object)
+        rollout_group_size = int(self.config.env.rollout.n) if self.config.env.rollout.n > 0 else 1
+        sample_ids = np.asarray(
+            [i // rollout_group_size for i in range(batch_size)],
+            dtype=np.int64,
+        )
+        rollout_ids = np.asarray(
+            [i % rollout_group_size for i in range(batch_size)],
+            dtype=np.int64,
+        )
         is_done = np.zeros(batch_size, dtype=bool)
         traj_uid = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
         total_batch_list = [[] for _ in range(batch_size)]
@@ -433,6 +450,17 @@ class TrajectoryCollector:
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
+            step_nums = np.full(batch_size, _step, dtype=np.int64)
+            batch.non_tensor_batch['sample_id'] = sample_ids
+            batch.non_tensor_batch['rollout_id'] = rollout_ids
+            batch.non_tensor_batch['step_num'] = step_nums
+            batch.non_tensor_batch['step_id'] = np.asarray(
+                [
+                    f"{int(sample_ids[i])}_{int(rollout_ids[i])}_{int(step_nums[i])}"
+                    for i in range(batch_size)
+                ],
+                dtype=object,
+            )
 
             batch = batch.union(batch_output)
             

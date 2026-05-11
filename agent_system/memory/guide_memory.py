@@ -3,11 +3,12 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,57 @@ _SKILL_TYPE_LABELS = {
     FAILURE_AVOIDANCE: "Failure avoidance",
     UNKNOWN_SKILL_TYPE: "Reusable skill",
 }
+_TORCH_MODULE = None
+_TORCH_IMPORT_FAILED = False
+
+
+def _get_torch_module():
+    global _TORCH_IMPORT_FAILED, _TORCH_MODULE
+    if _TORCH_IMPORT_FAILED:
+        return None
+    if _TORCH_MODULE is not None:
+        return _TORCH_MODULE
+    try:
+        import torch
+
+        _TORCH_MODULE = torch
+        return _TORCH_MODULE
+    except Exception:
+        _TORCH_IMPORT_FAILED = True
+        return None
+
+
+def _embedding_tensor_device(torch, preferred_device: Any = None, model: Any = None):
+    def usable(device):
+        if device.type != "cuda":
+            return True
+        return torch.cuda.is_available() and (
+            device.index is None or device.index < torch.cuda.device_count()
+        )
+
+    if preferred_device is not None:
+        preferred_device_text = str(preferred_device).strip()
+        if preferred_device_text and preferred_device_text.lower() not in _EMBEDDING_DEVICE_AUTO_ALIASES:
+            device = torch.device(preferred_device_text)
+            if usable(device):
+                return device
+
+    model_device = getattr(model, "device", None)
+    if model_device is not None:
+        device = torch.device(model_device)
+        if usable(device):
+            return device
+
+    try:
+        parameters = model.parameters() if model is not None else []
+        for parameter in parameters:
+            device = parameter.device
+            if usable(device):
+                return device
+    except Exception:
+        pass
+
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 def _normalize_text(text: Any, *, lowercase: bool = True, max_chars: Optional[int] = None) -> str:
@@ -71,67 +123,6 @@ def _text_similarity(a: str, b: str) -> float:
     return float(SequenceMatcher(None, a, b).ratio())
 
 
-def _stable_hash(parts: Iterable[str]) -> str:
-    digest = hashlib.sha1()
-    for part in parts:
-        digest.update(str(part).encode("utf-8"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
-def _slugify_text(text: Any, *, max_chars: int = 64) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_")
-    return slug[:max_chars].strip("_") or "general_task"
-
-
-def _infer_task_pattern(task_text: Any) -> str:
-    task = _normalize_text(task_text, lowercase=True)
-    if not task:
-        return "general_task_execution"
-
-    if "clean" in task:
-        return "clean_object_workflow"
-    if "heat" in task:
-        return "heat_object_workflow"
-    if "cool" in task:
-        return "cool_object_workflow"
-    if "look at" in task and "under" in task:
-        return "look_at_object_in_light"
-    webshop_strong_terms = (
-        "dollar", "$", "price", "rating", "reviews", "buy", "purchase",
-        "amazon", "product", "shopping",
-    )
-    webshop_attribute_terms = (
-        "under", "over", "size", "color", "material", "brand",
-    )
-    webshop_category_terms = (
-        "shirt", "shoe", "mug", "laptop", "dress", "jacket", "cream",
-        "bottle", "bag", "book", "watch", "case",
-    )
-    if (
-        any(term in task for term in webshop_strong_terms)
-        or (
-            any(term in task for term in webshop_category_terms)
-            and any(term in task for term in webshop_attribute_terms)
-        )
-    ):
-        return "constrained_product_search"
-    if any(term in task for term in ("examine", "inspect", "find", "look")):
-        return "object_location_and_examination"
-    if any(term in task for term in ("search", "answer", "question", "respond")):
-        return "information_search"
-    return "general_task_execution"
-
-
-def _title_from_skill_text(skill_text: Any, skill_type: str) -> str:
-    words = re.findall(r"[A-Za-z0-9]+", str(skill_text or ""))
-    if words:
-        title = " ".join(words[:5]).strip()
-    else:
-        title = _SKILL_TYPE_LABELS.get(skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE])
-    return title[:80]
-
-
 def _hashing_embedding(text: str, dim: int) -> List[float]:
     """Deterministic lexical fallback used when a sentence embedding model is unavailable."""
     import math
@@ -153,7 +144,74 @@ def _hashing_embedding(text: str, dim: int) -> List[float]:
     return [value / norm for value in vector]
 
 
-def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+def _coerce_embedding(embedding: Any, device: Any = None):
+    torch = _get_torch_module()
+    if torch is None:
+        return [float(value) for value in embedding]
+    device = _embedding_tensor_device(torch, preferred_device=device)
+    if torch.is_tensor(embedding):
+        return embedding.detach().to(dtype=torch.float32, device=device).flatten().clone()
+    return torch.as_tensor(embedding, dtype=torch.float32, device=device).flatten().clone()
+
+
+def _empty_embedding(dim: int, device: Any = None):
+    torch = _get_torch_module()
+    if torch is None:
+        return _hashing_embedding("", dim)
+    return torch.zeros(dim, dtype=torch.float32, device=_embedding_tensor_device(torch, preferred_device=device))
+
+
+def _embedding_matrix(embeddings: Sequence[Any], device: Any = None):
+    torch = _get_torch_module()
+    if torch is None or len(embeddings) <= 0:
+        return None
+
+    target_device = device
+    if target_device is None:
+        for embedding in embeddings:
+            if torch.is_tensor(embedding):
+                target_device = embedding.device
+                break
+    if target_device is None:
+        target_device = _embedding_tensor_device(torch)
+
+    vectors = []
+    width = None
+    for embedding in embeddings:
+        if torch.is_tensor(embedding):
+            vector = embedding.detach().to(dtype=torch.float32, device=target_device).flatten()
+        else:
+            vector = torch.as_tensor(embedding, dtype=torch.float32, device=target_device).flatten()
+        if vector.numel() <= 0:
+            return None
+        if width is None:
+            width = vector.numel()
+        elif vector.numel() != width:
+            return None
+        vectors.append(vector)
+    return torch.stack(vectors, dim=0)
+
+
+def _cosine_similarity(a: Any, b: Any) -> float:
+    torch = _get_torch_module()
+    if torch is not None and (torch.is_tensor(a) or torch.is_tensor(b)):
+        if torch.is_tensor(a):
+            device = a.device
+        elif torch.is_tensor(b):
+            device = b.device
+        else:
+            device = _embedding_tensor_device(torch)
+        left = a if torch.is_tensor(a) else torch.as_tensor(a, dtype=torch.float32, device=device)
+        right = b if torch.is_tensor(b) else torch.as_tensor(b, dtype=torch.float32, device=device)
+        left = left.detach().to(dtype=torch.float32, device=device).flatten()
+        right = right.detach().to(dtype=torch.float32, device=device).flatten()
+        if left.numel() <= 0 or right.numel() <= 0 or left.numel() != right.numel():
+            return 0.0
+        norm = torch.linalg.vector_norm(left) * torch.linalg.vector_norm(right)
+        if float(norm) <= 0.0:
+            return 0.0
+        return float(torch.dot(left, right) / norm)
+
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = 0.0
@@ -166,6 +224,43 @@ def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     if norm_a <= 0.0 or norm_b <= 0.0:
         return 0.0
     return float(dot / ((norm_a ** 0.5) * (norm_b ** 0.5)))
+
+
+def _cosine_similarity_matrix(queries: Sequence[Any], candidates: Sequence[Any]) -> List[List[float]]:
+    if len(queries) <= 0:
+        return []
+    if len(candidates) <= 0:
+        return [[] for _ in queries]
+
+    torch = _get_torch_module()
+    if torch is not None:
+        query_matrix = _embedding_matrix(queries)
+        candidate_matrix = _embedding_matrix(
+            candidates,
+            device=query_matrix.device if query_matrix is not None else None,
+        )
+        if (
+            query_matrix is not None
+            and candidate_matrix is not None
+            and query_matrix.shape[1] == candidate_matrix.shape[1]
+        ):
+            query_norms = torch.linalg.vector_norm(query_matrix, dim=1, keepdim=True).clamp_min(1e-12)
+            candidate_norms = torch.linalg.vector_norm(candidate_matrix, dim=1, keepdim=True).clamp_min(1e-12)
+            similarities = (query_matrix / query_norms) @ (candidate_matrix / candidate_norms).T
+            return similarities.detach().cpu().tolist()
+
+    return [
+        [
+            _cosine_similarity(query_embedding, candidate_embedding)
+            for candidate_embedding in candidates
+        ]
+        for query_embedding in queries
+    ]
+
+
+def _cosine_similarities(query: Any, candidates: Sequence[Any]) -> List[float]:
+    rows = _cosine_similarity_matrix([query], candidates)
+    return rows[0] if rows else []
 
 
 def build_augmented_observation_text(
@@ -241,7 +336,6 @@ def build_augmented_observation_text(
 @dataclass
 class GuideSkillRecord:
     skill_id: str
-    family_id: str
     task_text: str
     skill_text: str
     skill_type: str
@@ -250,15 +344,6 @@ class GuideSkillRecord:
     status: str
     created_step: int
     last_updated_step: int
-    title: str = ""
-    task_pattern: str = ""
-    applicability_text: str = ""
-    success_count: int = 0
-    failure_count: int = 0
-    evidence_count: int = 0
-    last_used_step: int = -1
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    evidence_examples: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -297,21 +382,17 @@ class COPDGuideMemory:
                 0.85,
             )
         )
-        self.merge_skill_similarity_thresh = float(
-            config.get(
-                "merge_skill_similarity_thresh",
-                0.9,
-            )
-        )
         self.max_skills = int(config.get("max_skills", 128))
         self.max_task_chars = int(config.get("max_task_chars", 256))
         self.max_skill_chars = int(config.get("max_skill_chars", 256))
         self.max_retrieval_chars = int(config.get("max_retrieval_chars", 768))
-        self.max_evidence_examples = int(config.get("max_evidence_examples", 8))
         self.max_embedding_cache_entries = int(config.get("max_embedding_cache_entries", 4096))
-        self.aggregate_with_llm = bool(config.get("aggregate_with_llm", False))
-        self.aggregate_min_group_size = max(int(config.get("aggregate_min_group_size", 2)), 1)
-        self.aggregate_max_candidates = max(int(config.get("aggregate_max_candidates", 8)), 1)
+        self.batch_cluster_similarity_thresh = float(
+            config.get(
+                "batch_cluster_similarity_thresh",
+                config.get("merge_task_similarity_thresh", 0.85),
+            )
+        )
         self.dump_freq_steps = int(config.get("dump_freq_steps", 0))
 
         dump_dir = config.get("dump_dir", None)
@@ -323,10 +404,28 @@ class COPDGuideMemory:
             self.dump_dir = None
 
         self._skills: List[GuideSkillRecord] = []
-        self._text_embedding_cache: Dict[str, List[float]] = {}
+        self._text_embedding_cache: Dict[str, Any] = {}
         self._embedding_model = None
         self._embedding_backend = "hashing" if self.embedding_model_path.lower() in _HASHING_EMBEDDING_ALIASES else "model"
         self._embedding_fallback_warned = False
+        self._merge_time_last_sec = 0.0
+        self._merge_time_total_sec = 0.0
+        self._merge_time_count = 0
+        self._retrieval_time_last_sec = 0.0
+        self._retrieval_time_total_sec = 0.0
+        self._retrieval_time_count = 0
+
+    def _record_merge_time(self, duration_sec: float) -> None:
+        duration = max(float(duration_sec), 0.0)
+        self._merge_time_last_sec = duration
+        self._merge_time_total_sec += duration
+        self._merge_time_count += 1
+
+    def _record_retrieval_time(self, duration_sec: float) -> None:
+        duration = max(float(duration_sec), 0.0)
+        self._retrieval_time_last_sec = duration
+        self._retrieval_time_total_sec += duration
+        self._retrieval_time_count += 1
 
     def _task_text_from_observation(self, observation: Any) -> str:
         return _normalize_text(extract_task_query(observation), lowercase=False, max_chars=self.max_task_chars)
@@ -334,115 +433,23 @@ class COPDGuideMemory:
     def _normalize_skill_text(self, skill_text: Any) -> str:
         return _normalize_text(skill_text, lowercase=False, max_chars=self.max_skill_chars)
 
-    def _skill_family_id(self, task_pattern: str) -> str:
-        return _slugify_text(task_pattern, max_chars=64)
-
-    def _build_applicability_text(
-        self,
-        *,
-        task_text: str,
-        task_pattern: str,
-        skill_type: str,
-        explicit_applicability: Any = "",
-    ) -> str:
-        explicit = _normalize_text(explicit_applicability, lowercase=False, max_chars=240)
-        if explicit:
-            return explicit
-
-        label = _SKILL_TYPE_LABELS.get(skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE]).lower()
-        if task_pattern == "constrained_product_search":
-            return (
-                f"Use this {label} for shopping tasks that require finding a product while "
-                "satisfying hard constraints such as category, price, color, size, material, "
-                "brand, ratings, or other product attributes."
-            )
-        if task_pattern.endswith("_object_workflow") or task_pattern in {
-            "look_at_object_in_light",
-            "object_location_and_examination",
-        }:
-            return (
-                f"Use this {label} for embodied tasks that require locating objects, checking "
-                "the current room state, and sequencing navigation or object interactions safely."
-            )
-        if task_pattern == "information_search":
-            return (
-                f"Use this {label} for search or question-answering tasks where the agent must "
-                "gather evidence before responding."
-            )
-        return f"Use this {label} for tasks with a similar workflow or failure pattern."
-
     def _build_retrieval_text(
         self,
         *,
-        family_id: str,
-        task_pattern: str,
-        skill_type: str,
-        title: str,
-        applicability_text: str,
         skill_text: str,
-        task_text: str = "",
+        task_text: str,
     ) -> str:
-        parts = [
-            family_id,
-            task_pattern,
-            _SKILL_TYPE_LABELS.get(skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE]),
-            title,
-            applicability_text,
-            skill_text,
-        ]
-        if task_text:
-            parts.append(task_text)
-        return _normalize_text(" ".join(parts), lowercase=False, max_chars=self.max_retrieval_chars)
-
-    def _build_query_retrieval_text(self, task_text: str) -> str:
-        task_pattern = _infer_task_pattern(task_text)
-        family_id = self._skill_family_id(task_pattern)
         return _normalize_text(
-            f"{family_id} {task_pattern} {task_text}",
+            f"{task_text} {skill_text}",
             lowercase=False,
             max_chars=self.max_retrieval_chars,
         )
 
-    def _build_skill_fields(
-        self,
-        *,
-        task_text: str,
-        skill_text: str,
-        skill_type: str,
-        title: Any = "",
-        task_pattern: Any = "",
-        applicability_text: Any = "",
-    ) -> Dict[str, str]:
-        normalized_task = _normalize_text(task_text, lowercase=False, max_chars=self.max_task_chars)
-        normalized_skill = self._normalize_skill_text(skill_text)
-        pattern = _normalize_text(task_pattern, lowercase=True, max_chars=96) or _infer_task_pattern(normalized_task)
-        family_id = self._skill_family_id(pattern)
-        normalized_title = _normalize_text(title, lowercase=False, max_chars=80) or _title_from_skill_text(
-            normalized_skill,
-            skill_type,
-        )
-        applicability = self._build_applicability_text(
-            task_text=normalized_task,
-            task_pattern=pattern,
-            skill_type=skill_type,
-            explicit_applicability=applicability_text,
-        )
-        retrieval_text = self._build_retrieval_text(
-            family_id=family_id,
-            task_pattern=pattern,
-            skill_type=skill_type,
-            title=normalized_title,
-            applicability_text=applicability,
-            skill_text=normalized_skill,
-            task_text=normalized_task,
-        )
-        return {
-            "family_id": family_id,
-            "task_pattern": pattern,
-            "title": normalized_title,
-            "applicability_text": applicability,
-            "retrieval_text": retrieval_text,
-        }
+    def _build_query_retrieval_text(self, task_text: str) -> str:
+        return _normalize_text(task_text, lowercase=False, max_chars=self.max_retrieval_chars)
+
+    def _record_retrieval_text(self, record: GuideSkillRecord) -> str:
+        return _normalize_text(record.retrieval_text, lowercase=False, max_chars=self.max_retrieval_chars)
 
     def _skill_type_from_success(self, episode_success: Optional[float]) -> str:
         if episode_success is None:
@@ -454,8 +461,6 @@ class COPDGuideMemory:
 
     def _format_skill_for_prompt(self, record: GuideSkillRecord) -> str:
         label = _SKILL_TYPE_LABELS.get(record.skill_type, _SKILL_TYPE_LABELS[UNKNOWN_SKILL_TYPE])
-        if record.applicability_text:
-            return f"{label}: {record.skill_text} Applies when: {record.applicability_text}"
         return f"{label}: {record.skill_text}"
 
     def _get_embedding_model(self):
@@ -464,7 +469,8 @@ class COPDGuideMemory:
         device_key = self.embedding_device.lower()
         cache_key = f"{self.embedding_model_path}::{device_key or 'auto'}"
         if cache_key in self._embedding_model_cache:
-            return self._embedding_model_cache[cache_key]
+            self._embedding_model = self._embedding_model_cache[cache_key]
+            return self._embedding_model
         try:
             from sentence_transformers import SentenceTransformer
 
@@ -473,7 +479,8 @@ class COPDGuideMemory:
                 model_kwargs["device"] = self.embedding_device
             model = SentenceTransformer(self.embedding_model_path, **model_kwargs)
             self._embedding_model_cache[cache_key] = model
-            return model
+            self._embedding_model = model
+            return self._embedding_model
         except Exception as exc:  # pragma: no cover - runtime environment dependent
             if not self._embedding_fallback_warned:
                 logger.warning(
@@ -486,10 +493,20 @@ class COPDGuideMemory:
             self._embedding_backend = "hashing"
             return None
 
+    def _embedding_device(self, model: Any = None):
+        torch = _get_torch_module()
+        if torch is None:
+            return None
+        return _embedding_tensor_device(
+            torch,
+            preferred_device=self.embedding_device,
+            model=model or self._embedding_model,
+        )
+
     def _embedding_key(self, text: Any) -> str:
         return _normalize_text(text, lowercase=True, max_chars=self.max_retrieval_chars)
 
-    def _remember_embedding(self, key: str, embedding: Sequence[float]) -> None:
+    def _remember_embedding(self, key: str, embedding: Any) -> None:
         if not key or self.max_embedding_cache_entries <= 0:
             return
         if key in self._text_embedding_cache:
@@ -497,9 +514,9 @@ class COPDGuideMemory:
         if len(self._text_embedding_cache) >= self.max_embedding_cache_entries:
             oldest_key = next(iter(self._text_embedding_cache))
             self._text_embedding_cache.pop(oldest_key, None)
-        self._text_embedding_cache[key] = [float(value) for value in embedding]
+        self._text_embedding_cache[key] = _coerce_embedding(embedding, device=self._embedding_device())
 
-    def _embed_tasks(self, task_texts: Sequence[Any]) -> List[List[float]]:
+    def _embed_tasks(self, task_texts: Sequence[Any]) -> List[Any]:
         normalized_tasks = [
             self._embedding_key(task_text)
             for task_text in task_texts
@@ -507,9 +524,13 @@ class COPDGuideMemory:
         if not normalized_tasks:
             return []
         model = self._get_embedding_model()
+        embedding_device = self._embedding_device(model)
         if model is None:
             return [
-                _hashing_embedding(normalized_task, self.hash_embedding_dim)
+                _coerce_embedding(
+                    _hashing_embedding(normalized_task, self.hash_embedding_dim),
+                    device=embedding_device,
+                )
                 for normalized_task in normalized_tasks
             ]
 
@@ -521,13 +542,13 @@ class COPDGuideMemory:
             convert_to_numpy=True,
         )
         return [
-            [float(value) for value in embedding.tolist()]
+            _coerce_embedding(embedding, device=embedding_device)
             for embedding in embeddings
         ]
 
-    def _embed_tasks_deduped(self, task_texts: Sequence[Any]) -> List[List[float]]:
+    def _embed_tasks_deduped(self, task_texts: Sequence[Any]) -> List[Any]:
         ordered_keys = [self._embedding_key(task_text) for task_text in task_texts]
-        empty_embedding = _hashing_embedding("", self.hash_embedding_dim)
+        empty_embedding = _empty_embedding(self.hash_embedding_dim, device=self._embedding_device())
         embeddings_by_key = {
             key: self._text_embedding_cache[key]
             for key in ordered_keys
@@ -550,9 +571,9 @@ class COPDGuideMemory:
             for key in ordered_keys
         ]
 
-    def _embed_task(self, task_text: str) -> List[float]:
+    def _embed_task(self, task_text: str):
         embeddings = self._embed_tasks_deduped([task_text])
-        return embeddings[0] if embeddings else _hashing_embedding("", self.hash_embedding_dim)
+        return embeddings[0] if embeddings else _empty_embedding(self.hash_embedding_dim, device=self._embedding_device())
 
     def _is_promoted(self, record: GuideSkillRecord) -> bool:
         return record.support_count >= self.promote_min_support
@@ -560,45 +581,69 @@ class COPDGuideMemory:
     def _refresh_status(self, record: GuideSkillRecord) -> None:
         record.status = "active" if self._is_promoted(record) else "pending"
 
-    def _rank_record(self, record: GuideSkillRecord) -> Tuple[int, int]:
-        return (
-            record.support_count,
-            record.last_updated_step,
-        )
-
     def _match_skill_record(
         self,
         *,
-        retrieval_embedding: Sequence[float],
-        skill_text: str,
+        retrieval_embedding: Any,
         skill_type: str,
-        family_id: str,
         task_text: str,
     ) -> Optional[GuideSkillRecord]:
-        record_embeddings = self._embed_tasks_deduped(
-            [record.retrieval_text for record in self._skills]
+        del task_text
+        return self._matching_skill_records(
+            retrieval_embeddings=[retrieval_embedding],
+            skill_types=[skill_type],
+        )[0]
+
+    def _matching_skill_records(
+        self,
+        *,
+        retrieval_embeddings: Sequence[Any],
+        skill_types: Sequence[str],
+        records: Optional[Sequence[GuideSkillRecord]] = None,
+        record_embeddings: Optional[Sequence[Any]] = None,
+    ) -> List[Optional[GuideSkillRecord]]:
+        if len(retrieval_embeddings) <= 0:
+            return []
+
+        candidate_records = list(self._skills if records is None else records)
+        if not candidate_records:
+            return [None for _ in retrieval_embeddings]
+
+        embeddings = list(record_embeddings) if record_embeddings is not None else self._embed_tasks_deduped(
+            [self._record_retrieval_text(record) for record in candidate_records]
         )
-        task_key = _normalize_text(task_text, lowercase=True, max_chars=self.max_task_chars)
-        for record, record_embedding in zip(self._skills, record_embeddings):
-            if record.skill_type != skill_type:
-                continue
-            if (
-                task_key
-                and task_key == _normalize_text(record.task_text, lowercase=True, max_chars=self.max_task_chars)
-                and record.family_id == family_id
-            ):
-                return record
-            retrieval_similarity = _cosine_similarity(retrieval_embedding, record_embedding)
-            skill_similarity = _text_similarity(record.skill_text, skill_text)
-            if (
-                retrieval_similarity >= self.merge_task_similarity_thresh
-                and (
-                    record.family_id == family_id
-                    or skill_similarity >= self.merge_skill_similarity_thresh
-                )
-            ):
-                return record
-        return None
+        similarity_rows = _cosine_similarity_matrix(retrieval_embeddings, embeddings)
+        matches: List[Optional[GuideSkillRecord]] = []
+        for skill_type, similarities in zip(skill_types, similarity_rows):
+            matched_record = None
+            for record, similarity in zip(candidate_records, similarities):
+                if record.skill_type != skill_type:
+                    continue
+                if float(similarity) >= self.merge_task_similarity_thresh:
+                    matched_record = record
+                    break
+            matches.append(matched_record)
+
+        while len(matches) < len(retrieval_embeddings):
+            matches.append(None)
+        return matches
+
+    def _merge_candidate_records(
+        self,
+        *,
+        candidates: Sequence[Dict[str, Any]],
+        retrieval_embeddings: Sequence[Any],
+    ) -> List[Optional[GuideSkillRecord]]:
+        skill_records = list(self._skills)
+        skill_embeddings = self._embed_tasks_deduped(
+            [self._record_retrieval_text(record) for record in skill_records]
+        )
+        return self._matching_skill_records(
+            retrieval_embeddings=retrieval_embeddings,
+            skill_types=[str(candidate["skill_type"]) for candidate in candidates],
+            records=skill_records,
+            record_embeddings=skill_embeddings,
+        )
 
     def _prune_records(self) -> None:
         if self.max_skills <= 0:
@@ -620,39 +665,43 @@ class COPDGuideMemory:
         task_text: str,
         skill_text: str,
         skill_type: str,
-        family_id: str,
-        title: str,
-        task_pattern: str,
-        applicability_text: str,
-        retrieval_text: str,
         global_step: int,
-        source: str,
         support_increment: int = 1,
-        retrieval_embedding: Optional[Sequence[float]] = None,
-        evidence_examples: Optional[Sequence[Dict[str, Any]]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        retrieval_embedding: Optional[Any] = None,
+        matched_record: Optional[GuideSkillRecord] = None,
+        match_precomputed: bool = False,
     ) -> Tuple[bool, bool]:
         normalized_task = _normalize_text(task_text, lowercase=False, max_chars=self.max_task_chars)
         normalized_skill = self._normalize_skill_text(skill_text)
         if not normalized_task or not normalized_skill:
             return False, False
 
+        retrieval_text = self._build_retrieval_text(
+            task_text=normalized_task,
+            skill_text=normalized_skill,
+        )
         if retrieval_embedding is None:
             retrieval_embedding = self._embed_task(retrieval_text)
         else:
-            retrieval_embedding = [float(value) for value in retrieval_embedding]
-        record = self._match_skill_record(
-            retrieval_embedding=retrieval_embedding,
-            skill_text=normalized_skill,
-            skill_type=skill_type,
-            family_id=family_id,
-            task_text=normalized_task,
-        )
+            retrieval_embedding = _coerce_embedding(retrieval_embedding, device=self._embedding_device())
+        if match_precomputed:
+            record = matched_record if matched_record in self._skills else None
+            if matched_record is not None and record is None:
+                record = self._match_skill_record(
+                    retrieval_embedding=retrieval_embedding,
+                    skill_type=skill_type,
+                    task_text=normalized_task,
+                )
+        else:
+            record = self._match_skill_record(
+                retrieval_embedding=retrieval_embedding,
+                skill_type=skill_type,
+                task_text=normalized_task,
+            )
         merged = record is not None
         if record is None:
             record = GuideSkillRecord(
                 skill_id=f"skill_{uuid.uuid4().hex[:12]}",
-                family_id=family_id,
                 task_text=normalized_task,
                 skill_text=normalized_skill,
                 skill_type=skill_type,
@@ -661,178 +710,108 @@ class COPDGuideMemory:
                 status="pending",
                 created_step=global_step,
                 last_updated_step=global_step,
-                title=title,
-                task_pattern=task_pattern,
-                applicability_text=applicability_text,
-                metadata={},
             )
             self._skills.append(record)
         else:
             if len(normalized_skill) > len(record.skill_text):
                 record.skill_text = normalized_skill
-                record.title = title or record.title
                 record.task_text = normalized_task
-            if applicability_text and len(applicability_text) > len(record.applicability_text):
-                record.applicability_text = applicability_text
-            record.retrieval_text = self._build_retrieval_text(
-                family_id=record.family_id,
-                task_pattern=record.task_pattern or task_pattern,
-                skill_type=record.skill_type,
-                title=record.title or title,
-                applicability_text=record.applicability_text or applicability_text,
-                skill_text=record.skill_text,
-                task_text=record.task_text,
-            )
+                record.retrieval_text = self._build_retrieval_text(
+                    task_text=record.task_text,
+                    skill_text=record.skill_text,
+                )
 
         record.support_count += max(int(support_increment), 1)
-        if skill_type == SUCCESS_WORKFLOW:
-            record.success_count += max(int(support_increment), 1)
-        elif skill_type == FAILURE_AVOIDANCE:
-            record.failure_count += max(int(support_increment), 1)
         record.last_updated_step = global_step
-        incoming_evidence = list(evidence_examples or [])
-        if incoming_evidence:
-            record.evidence_examples.extend(incoming_evidence)
-            record.evidence_examples = record.evidence_examples[-self.max_evidence_examples:]
-            record.evidence_count += len(incoming_evidence)
-        record.metadata.update(
-            {
-                "source": source,
-                "last_task_hash": _stable_hash([normalized_task])[:12],
-                "skill_type": skill_type,
-                "family_id": record.family_id,
-                "task_pattern": record.task_pattern,
-            }
-        )
-        if metadata:
-            record.metadata.update(metadata)
         self._refresh_status(record)
         self._prune_records()
         return True, merged
 
+    def _build_candidate_cluster_text(self, candidate: Dict[str, Any]) -> str:
+        return _normalize_text(
+            f"{candidate.get('task_text', '')} {candidate.get('skill_text', '')}",
+            lowercase=False,
+            max_chars=self.max_retrieval_chars,
+        )
+
+    def _build_clustered_candidate(
+        self,
+        group: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        representative = max(
+            group,
+            key=lambda item: (len(item["skill_text"]), item["traj_uid"]),
+        )
+        return {
+            "task_text": representative["task_text"],
+            "skill_text": self._normalize_skill_text(representative["skill_text"]),
+            "skill_type": representative["skill_type"],
+            "support_increment": len(group),
+        }
+
     def _cluster_batch_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
-        *,
-        skill_aggregator: Optional[Callable[..., Dict[str, Any]]] = None,
-        global_step: Optional[int] = None,
-        analysis_mode: str = "teacher_bootstrap",
     ) -> List[Dict[str, Any]]:
         if not self.enable_batch_task_aggregation:
             return [
-                {
-                    "task_text": candidate["task_text"],
-                    "skill_text": candidate["skill_text"],
-                    "skill_type": candidate["skill_type"],
-                    "title": candidate.get("title", ""),
-                    "task_pattern": candidate.get("task_pattern", ""),
-                    "applicability_text": candidate.get("applicability_text", ""),
-                    "support_increment": 1,
-                    "traj_uids": [str(candidate["traj_uid"])],
-                    "episode_success_values": (
-                        [candidate["episode_success"]]
-                        if candidate["episode_success"] is not None
-                        else []
-                    ),
-                    "step_hint_count": int(candidate["step_hint_count"]),
-                    "candidate_hints": [candidate["skill_text"]],
-                }
+                self._build_clustered_candidate([candidate])
                 for candidate in candidates
             ]
 
-        grouped_candidates: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
-        for candidate in candidates:
-            task_key = _normalize_text(candidate["task_text"], lowercase=True, max_chars=self.max_task_chars)
-            grouped_candidates[(task_key, candidate["skill_type"])].append(candidate)
+        cluster_texts = [
+            self._build_candidate_cluster_text(candidate)
+            for candidate in candidates
+        ]
+        candidate_embeddings = self._embed_tasks_deduped(cluster_texts)
+        clusters: List[Dict[str, Any]] = []
+        for candidate, embedding in zip(candidates, candidate_embeddings):
+            best_cluster_idx = None
+            best_similarity = -1.0
+            for cluster_idx, cluster in enumerate(clusters):
+                if cluster["skill_type"] != candidate["skill_type"]:
+                    continue
+                cluster_similarity = max(
+                    _cosine_similarity(embedding, existing_embedding)
+                    for existing_embedding in cluster["embeddings"]
+                )
+                if cluster_similarity > best_similarity:
+                    best_similarity = cluster_similarity
+                    best_cluster_idx = cluster_idx
 
-        clustered: List[Dict[str, Any]] = []
-        for (_, skill_type), group in grouped_candidates.items():
-            representative = max(
-                group,
-                key=lambda item: (len(item["skill_text"]), item["traj_uid"]),
-            )
-            candidate_hints = [
-                item["skill_text"]
-                for item in group[: min(len(group), self.aggregate_max_candidates)]
-            ]
-            aggregated_fields: Dict[str, Any] = {}
-            aggregation_used = False
-            aggregation_error = ""
             if (
-                self.aggregate_with_llm
-                and skill_aggregator is not None
-                and len(group) >= self.aggregate_min_group_size
-                and candidate_hints
+                best_cluster_idx is not None
+                and best_similarity >= self.batch_cluster_similarity_thresh
             ):
-                try:
-                    aggregated_fields = skill_aggregator(
-                        task_text=representative["task_text"],
-                        skill_type=skill_type,
-                        candidate_hints=candidate_hints,
-                        episode_success_values=[
-                            item["episode_success"]
-                            for item in group
-                            if item["episode_success"] is not None
-                        ],
-                        global_step=global_step,
-                        analysis_mode=analysis_mode,
-                    ) or {}
-                    aggregation_used = bool(
-                        str(aggregated_fields.get("skill_text") or "").strip()
-                    )
-                    if not aggregation_used:
-                        aggregated_fields = {}
-                except Exception as exc:  # pragma: no cover - runtime backend dependent
-                    aggregation_error = str(exc)
-                    logger.warning(
-                        "Guide memory LLM skill aggregation failed for task=%s type=%s: %s",
-                        representative["task_text"],
-                        skill_type,
-                        exc,
-                    )
+                clusters[best_cluster_idx]["candidates"].append(candidate)
+                clusters[best_cluster_idx]["embeddings"].append(embedding)
+            else:
+                clusters.append(
+                    {
+                        "skill_type": candidate["skill_type"],
+                        "candidates": [candidate],
+                        "embeddings": [embedding],
+                    }
+                )
 
-            aggregated_skill_text = self._normalize_skill_text(
-                aggregated_fields.get("skill_text")
-                or representative["skill_text"]
-            )
-            aggregated_title = aggregated_fields.get("title") or representative.get("title", "")
-            aggregated_task_pattern = aggregated_fields.get("task_pattern") or representative.get("task_pattern", "")
-            aggregated_applicability = (
-                aggregated_fields.get("applicability_text")
-                or aggregated_fields.get("when_to_apply")
-                or representative.get("applicability_text", "")
-            )
-            clustered.append(
-                {
-                    "task_text": representative["task_text"],
-                    "skill_text": aggregated_skill_text,
-                    "skill_type": skill_type,
-                    "title": aggregated_title,
-                    "task_pattern": aggregated_task_pattern,
-                    "applicability_text": aggregated_applicability,
-                    "support_increment": len(group),
-                    "traj_uids": [str(item["traj_uid"]) for item in group],
-                    "episode_success_values": [
-                        item["episode_success"]
-                        for item in group
-                        if item["episode_success"] is not None
-                    ],
-                    "step_hint_count": sum(int(item["step_hint_count"]) for item in group),
-                    "candidate_hints": candidate_hints,
-                    "aggregation_used": aggregation_used,
-                    "aggregation_error": aggregation_error,
-                    "aggregation_raw": aggregated_fields.get("raw_output", ""),
-                }
-            )
+        return [
+            self._build_clustered_candidate(cluster["candidates"])
+            for cluster in clusters
+        ]
 
-        return clustered
+    def _active_records_and_embeddings(self) -> Tuple[List[GuideSkillRecord], List[Any]]:
+        active_records = [record for record in self._skills if record.status == "active"]
+        active_embeddings = self._embed_tasks_deduped(
+            [self._record_retrieval_text(record) for record in active_records]
+        )
+        return active_records, active_embeddings
 
-    def _retrieve_guides_from_embedding(
+    def _retrieval_result_from_similarities(
         self,
         *,
         task_text: str,
-        query_embedding: Sequence[float],
-        global_step: Optional[int] = None,
+        records: Sequence[GuideSkillRecord],
+        similarities: Sequence[float],
         top_k: Optional[int] = None,
         similarity_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -841,23 +820,12 @@ class COPDGuideMemory:
             "skills": [],
             "skill_records": [],
         }
-        if not self.enabled or not task_text:
-            return result
-
         threshold = self.similarity_threshold if similarity_threshold is None else float(similarity_threshold)
-        scored_records = []
-        active_records = [record for record in self._skills if record.status == "active"]
-        active_embeddings = self._embed_tasks_deduped(
-            [record.retrieval_text for record in active_records]
-        )
-        for record, record_embedding in zip(active_records, active_embeddings):
-            if record.status != "active":
-                continue
-            similarity = _cosine_similarity(query_embedding, record_embedding)
-            if similarity < threshold:
-                continue
-            scored_records.append((similarity, record))
-
+        scored_records = [
+            (float(similarity), record)
+            for record, similarity in zip(records, similarities)
+            if record.status == "active" and float(similarity) >= threshold
+        ]
         scored_records.sort(
             key=lambda item: (
                 item[0],
@@ -873,19 +841,13 @@ class COPDGuideMemory:
         skills = []
         skill_records = []
         for similarity, record in selected:
-            if global_step is not None:
-                record.last_used_step = global_step
             skills.append(self._format_skill_for_prompt(record))
             skill_records.append(
                 {
                     "skill_id": record.skill_id,
-                    "family_id": record.family_id,
                     "task_text": record.task_text,
                     "skill_text": record.skill_text,
                     "skill_type": record.skill_type,
-                    "title": record.title,
-                    "task_pattern": record.task_pattern,
-                    "applicability_text": record.applicability_text,
                     "similarity": float(similarity),
                     "support_count": int(record.support_count),
                 }
@@ -894,6 +856,33 @@ class COPDGuideMemory:
         result["skills"] = skills
         result["skill_records"] = skill_records
         return result
+
+    def _retrieve_guides_from_embedding(
+        self,
+        *,
+        task_text: str,
+        query_embedding: Any,
+        global_step: Optional[int] = None,
+        top_k: Optional[int] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        result = {
+            "task_query": task_text,
+            "skills": [],
+            "skill_records": [],
+        }
+        if not self.enabled or not task_text:
+            return result
+
+        active_records, active_embeddings = self._active_records_and_embeddings()
+        similarities = _cosine_similarities(query_embedding, active_embeddings)
+        return self._retrieval_result_from_similarities(
+            task_text=task_text,
+            records=active_records,
+            similarities=similarities,
+            top_k=top_k,
+            similarity_threshold=similarity_threshold,
+        )
 
     def retrieve_guides(
         self,
@@ -904,22 +893,26 @@ class COPDGuideMemory:
         similarity_threshold: Optional[float] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        task_text = _normalize_text(task_query, lowercase=False, max_chars=self.max_task_chars)
-        if not self.enabled or not task_text:
-            return {
-                "task_query": task_text,
-                "skills": [],
-                "skill_records": [],
-            }
-        query_retrieval_text = self._build_query_retrieval_text(task_text)
-        query_embedding = self._embed_task(query_retrieval_text)
-        return self._retrieve_guides_from_embedding(
-            task_text=task_text,
-            query_embedding=query_embedding,
-            global_step=global_step,
-            top_k=top_k,
-            similarity_threshold=similarity_threshold,
-        )
+        started = time.perf_counter()
+        try:
+            task_text = _normalize_text(task_query, lowercase=False, max_chars=self.max_task_chars)
+            if not self.enabled or not task_text:
+                return {
+                    "task_query": task_text,
+                    "skills": [],
+                    "skill_records": [],
+                }
+            query_retrieval_text = self._build_query_retrieval_text(task_text)
+            query_embedding = self._embed_task(query_retrieval_text)
+            return self._retrieve_guides_from_embedding(
+                task_text=task_text,
+                query_embedding=query_embedding,
+                global_step=global_step,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
+            )
+        finally:
+            self._record_retrieval_time(time.perf_counter() - started)
 
     def retrieve_guides_batch(
         self,
@@ -930,43 +923,51 @@ class COPDGuideMemory:
         similarity_threshold: Optional[float] = None,
         **_: Any,
     ) -> List[Dict[str, Any]]:
-        task_texts = [
-            _normalize_text(task_query, lowercase=False, max_chars=self.max_task_chars)
-            for task_query in task_queries
-        ]
-        results = [
-            {
-                "task_query": task_text,
-                "skills": [],
-                "skill_records": [],
-            }
-            for task_text in task_texts
-        ]
-        if not self.enabled:
-            return results
+        started = time.perf_counter()
+        try:
+            task_texts = [
+                _normalize_text(task_query, lowercase=False, max_chars=self.max_task_chars)
+                for task_query in task_queries
+            ]
+            results = [
+                {
+                    "task_query": task_text,
+                    "skills": [],
+                    "skill_records": [],
+                }
+                for task_text in task_texts
+            ]
+            if not self.enabled:
+                return results
 
-        valid_positions = [
-            idx
-            for idx, task_text in enumerate(task_texts)
-            if task_text
-        ]
-        if not valid_positions:
-            return results
+            valid_positions = [
+                idx
+                for idx, task_text in enumerate(task_texts)
+                if task_text
+            ]
+            if not valid_positions:
+                return results
 
-        valid_query_texts = [
-            self._build_query_retrieval_text(task_texts[idx])
-            for idx in valid_positions
-        ]
-        embeddings = self._embed_tasks_deduped(valid_query_texts)
-        for idx, embedding in zip(valid_positions, embeddings):
-            results[idx] = self._retrieve_guides_from_embedding(
-                task_text=task_texts[idx],
-                query_embedding=embedding,
-                global_step=global_step,
-                top_k=top_k,
-                similarity_threshold=similarity_threshold,
-            )
-        return results
+            valid_query_texts = [
+                self._build_query_retrieval_text(task_texts[idx])
+                for idx in valid_positions
+            ]
+            embeddings = self._embed_tasks_deduped(valid_query_texts)
+            active_records, active_embeddings = self._active_records_and_embeddings()
+            similarity_rows = _cosine_similarity_matrix(embeddings, active_embeddings)
+            if len(similarity_rows) != len(valid_positions):
+                similarity_rows = [[] for _ in valid_positions]
+            for idx, similarities in zip(valid_positions, similarity_rows):
+                results[idx] = self._retrieval_result_from_similarities(
+                    task_text=task_texts[idx],
+                    records=active_records,
+                    similarities=similarities,
+                    top_k=top_k,
+                    similarity_threshold=similarity_threshold,
+                )
+            return results
+        finally:
+            self._record_retrieval_time(time.perf_counter() - started)
 
     def _select_diverse_records(
         self,
@@ -1060,17 +1061,16 @@ class COPDGuideMemory:
         global_step: int,
         episode_success: Optional[Sequence[float]] = None,
         analysis_mode: str = "teacher_bootstrap",
-        skill_aggregator: Optional[Callable[..., Dict[str, Any]]] = None,
     ) -> Dict[str, float]:
-        del anchor_obs, critical_mask
+        del anchor_obs, critical_mask, analysis_mode
         metrics = {
             "copd/guide_memory/enabled": 1.0 if self.enabled else 0.0,
             "copd/guide_memory/skill_candidates_added": 0.0,
             "copd/guide_memory/skill_candidates_merged": 0.0,
             "copd/guide_memory/batch_candidate_count": 0.0,
             "copd/guide_memory/batch_cluster_count": 0.0,
-            "copd/guide_memory/batch_llm_aggregation_count": 0.0,
-            "copd/guide_memory/batch_llm_aggregation_error_count": 0.0,
+            "copd/guide_memory/batch_embedding_aggregation_count": 0.0,
+            "copd/guide_memory/skill_merge_time_sec": 0.0,
         }
         if not self.enabled:
             return metrics
@@ -1113,82 +1113,57 @@ class COPDGuideMemory:
                     "task_text": task_text,
                     "skill_text": self._normalize_skill_text(skill_text),
                     "skill_type": self._skill_type_from_success(episode_success_value),
-                    "title": analysis.get("skill_title") or analysis.get("title") or "",
-                    "task_pattern": analysis.get("task_pattern") or "",
-                    "applicability_text": analysis.get("applicability_text") or analysis.get("when_to_apply") or "",
-                    "episode_success": episode_success_value,
-                    "episode_summary": str(analysis.get("episode_summary", "")),
-                    "step_hint_count": len(analysis.get("step_hints", {}) or {}),
                 }
             )
 
-        clustered_candidates = self._cluster_batch_candidates(
-            candidates,
-            skill_aggregator=skill_aggregator,
-            global_step=global_step,
-            analysis_mode=analysis_mode,
-        )
+        clustered_candidates = self._cluster_batch_candidates(candidates)
         metrics["copd/guide_memory/batch_candidate_count"] = float(len(candidates))
         metrics["copd/guide_memory/batch_cluster_count"] = float(len(clustered_candidates))
-        metrics["copd/guide_memory/batch_llm_aggregation_count"] = float(
-            sum(1 for candidate in clustered_candidates if candidate.get("aggregation_used"))
-        )
-        metrics["copd/guide_memory/batch_llm_aggregation_error_count"] = float(
-            sum(1 for candidate in clustered_candidates if candidate.get("aggregation_error"))
+        metrics["copd/guide_memory/batch_embedding_aggregation_count"] = float(
+            sum(
+                1
+                for candidate in clustered_candidates
+                if int(candidate.get("support_increment", 1)) > 1
+            )
         )
 
-        skill_fields = [
-            self._build_skill_fields(
-                task_text=candidate["task_text"],
-                skill_text=candidate["skill_text"],
-                skill_type=candidate["skill_type"],
-                title=candidate.get("title", ""),
-                task_pattern=candidate.get("task_pattern", ""),
-                applicability_text=candidate.get("applicability_text", ""),
-            )
-            for candidate in clustered_candidates
-        ]
-        candidate_embeddings = self._embed_tasks_deduped(
-            [fields["retrieval_text"] for fields in skill_fields]
-        )
-        for candidate, fields, retrieval_embedding in zip(clustered_candidates, skill_fields, candidate_embeddings):
-            evidence_examples = [
-                {
-                    "task_text": candidate["task_text"],
-                    "traj_uids": candidate.get("traj_uids", []),
-                    "episode_success_values": candidate.get("episode_success_values", []),
-                    "skill_text": candidate["skill_text"],
-                    "global_step": int(global_step),
-                }
+        merge_started = time.perf_counter()
+        try:
+            retrieval_texts = [
+                self._build_retrieval_text(
+                    task_text=candidate["task_text"],
+                    skill_text=candidate["skill_text"],
+                )
+                for candidate in clustered_candidates
             ]
-            added, merged = self._add_skill(
-                task_text=candidate["task_text"],
-                skill_text=candidate["skill_text"],
-                skill_type=candidate["skill_type"],
-                family_id=fields["family_id"],
-                title=fields["title"],
-                task_pattern=fields["task_pattern"],
-                applicability_text=fields["applicability_text"],
-                retrieval_text=fields["retrieval_text"],
-                global_step=global_step,
-                source=f"{analysis_mode}/episode_hint",
-                support_increment=int(candidate.get("support_increment", 1)),
-                retrieval_embedding=retrieval_embedding,
-                evidence_examples=evidence_examples,
-                metadata={
-                    "traj_uids": candidate.get("traj_uids", []),
-                    "analysis_mode": analysis_mode,
-                    "episode_success_values": candidate.get("episode_success_values", []),
-                    "step_hint_count": int(candidate.get("step_hint_count", 0)),
-                    "batch_support_increment": int(candidate.get("support_increment", 1)),
-                    "candidate_hints": candidate.get("candidate_hints", []),
-                    "aggregation_used": bool(candidate.get("aggregation_used", False)),
-                    "aggregation_error": str(candidate.get("aggregation_error", "")),
-                    "aggregation_raw": str(candidate.get("aggregation_raw", "")),
-                },
+            candidate_embeddings = self._embed_tasks_deduped(
+                retrieval_texts
             )
-            metrics["copd/guide_memory/skill_candidates_added"] += float(added)
-            metrics["copd/guide_memory/skill_candidates_merged"] += float(merged)
+            matched_records = self._merge_candidate_records(
+                candidates=clustered_candidates,
+                retrieval_embeddings=candidate_embeddings,
+            )
+            for candidate, retrieval_embedding, matched_record in zip(
+                clustered_candidates,
+                candidate_embeddings,
+                matched_records,
+            ):
+                added, merged = self._add_skill(
+                    task_text=candidate["task_text"],
+                    skill_text=candidate["skill_text"],
+                    skill_type=candidate["skill_type"],
+                    global_step=global_step,
+                    support_increment=int(candidate.get("support_increment", 1)),
+                    retrieval_embedding=retrieval_embedding,
+                    matched_record=matched_record,
+                    match_precomputed=True,
+                )
+                metrics["copd/guide_memory/skill_candidates_added"] += float(added)
+                metrics["copd/guide_memory/skill_candidates_merged"] += float(merged)
+        finally:
+            merge_time_sec = time.perf_counter() - merge_started
+            self._record_merge_time(merge_time_sec)
+            metrics["copd/guide_memory/skill_merge_time_sec"] = float(merge_time_sec)
 
         metrics.update(self.snapshot_metrics(prefix="copd/guide_memory"))
         self._dump_if_needed(global_step=global_step)
@@ -1203,20 +1178,34 @@ class COPDGuideMemory:
 
         support_values = [record.support_count for record in self._skills]
         mean_support = float(sum(support_values) / len(support_values)) if support_values else 0.0
-        family_count = len({record.family_id for record in self._skills if record.family_id})
-        evidence_total = sum(int(record.evidence_count) for record in self._skills)
+        mean_merge_time = (
+            self._merge_time_total_sec / self._merge_time_count
+            if self._merge_time_count > 0
+            else 0.0
+        )
+        mean_retrieval_time = (
+            self._retrieval_time_total_sec / self._retrieval_time_count
+            if self._retrieval_time_count > 0
+            else 0.0
+        )
         return {
             f"{prefix}/skill_total": float(len(self._skills)),
             f"{prefix}/skill_active": _count_status("active"),
             f"{prefix}/skill_pending": _count_status("pending"),
-            f"{prefix}/skill_family_total": float(family_count),
             f"{prefix}/skill_success_workflow": _count_type(SUCCESS_WORKFLOW),
             f"{prefix}/skill_failure_avoidance": _count_type(FAILURE_AVOIDANCE),
             f"{prefix}/skill_unknown": _count_type(UNKNOWN_SKILL_TYPE),
             f"{prefix}/skill_mean_support": mean_support,
-            f"{prefix}/skill_evidence_total": float(evidence_total),
             f"{prefix}/embedding_cache_entries": float(len(self._text_embedding_cache)),
-            f"{prefix}/aggregate_with_llm": 1.0 if self.aggregate_with_llm else 0.0,
+            f"{prefix}/batch_cluster_similarity_thresh": float(self.batch_cluster_similarity_thresh),
+            f"{prefix}/skill_merge_time_sec_last": float(self._merge_time_last_sec),
+            f"{prefix}/skill_merge_time_sec_total": float(self._merge_time_total_sec),
+            f"{prefix}/skill_merge_time_sec_mean": float(mean_merge_time),
+            f"{prefix}/skill_merge_time_count": float(self._merge_time_count),
+            f"{prefix}/skill_retrieval_time_sec_last": float(self._retrieval_time_last_sec),
+            f"{prefix}/skill_retrieval_time_sec_total": float(self._retrieval_time_total_sec),
+            f"{prefix}/skill_retrieval_time_sec_mean": float(mean_retrieval_time),
+            f"{prefix}/skill_retrieval_time_count": float(self._retrieval_time_count),
         }
 
     def dump_snapshot(self, path: str) -> None:

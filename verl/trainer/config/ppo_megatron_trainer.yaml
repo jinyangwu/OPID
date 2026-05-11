@@ -303,6 +303,7 @@ algorithm:
     phase_switch_after_steps: null
     use_with_memory_after_phase_switch: False
     mode: "mean_norm"
+    enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
     similarity_thresh: 0.95
     selector: "stats"

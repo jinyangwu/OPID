@@ -277,50 +277,6 @@ class COPDEpisodeAnalyzer:
             episode_success=episode_success,
         )
 
-    def aggregate_guide_skill_candidates(
-        self,
-        *,
-        task_text: str,
-        skill_type: str,
-        candidate_hints: Sequence[object],
-        episode_success_values: Optional[Sequence[object]] = None,
-        global_step: Optional[int] = None,
-        analysis_mode: str = "teacher_bootstrap",
-    ) -> Dict[str, object]:
-        normalized_hints = [
-            " ".join(str(hint or "").split())
-            for hint in candidate_hints
-            if str(hint or "").strip()
-        ]
-        if not normalized_hints:
-            return {}
-
-        prompt = self._build_guide_skill_aggregation_prompt(
-            task_text=task_text,
-            skill_type=skill_type,
-            candidate_hints=normalized_hints,
-            episode_success_values=episode_success_values or [],
-            global_step=global_step,
-            analysis_mode=analysis_mode,
-        )
-        max_tokens = int(
-            os.environ.get(
-                "COPD_GUIDE_SKILL_AGGREGATE_MAX_COMPLETION_TOKENS",
-                "1024",
-            )
-        )
-        content = chat_completion_with_retry(
-            client=self._get_openai_client(),
-            model=self.model,
-            prompt=prompt,
-            retries=max(1, int(os.environ.get("OPENAI_API_RETRIES", "5"))),
-            retry_delay=float(os.environ.get("OPENAI_API_RETRY_DELAY", "1.0")),
-            max_completion_tokens=min(max_tokens, self.max_completion_tokens),
-        )
-        parsed = self._parse_guide_skill_aggregation_response(content)
-        parsed["raw_output"] = content
-        return parsed
-
     def _analyze_episode_with_openai(
         self,
         steps: List[Dict[str, object]],
@@ -367,101 +323,6 @@ class COPDEpisodeAnalyzer:
         parsed["llm_raw_output"] = content
         return parsed
 
-    def _build_guide_skill_aggregation_prompt(
-        self,
-        *,
-        task_text: str,
-        skill_type: str,
-        candidate_hints: Sequence[str],
-        episode_success_values: Sequence[object],
-        global_step: Optional[int],
-        analysis_mode: str,
-    ) -> Dict[str, Any]:
-        if skill_type == "success_workflow":
-            skill_goal = (
-                "Synthesize a positive reusable workflow: preserve the common action ordering, "
-                "observation checks, and decision rules that made these trajectories succeed."
-            )
-            skill_label = "success workflow"
-        elif skill_type == "failure_avoidance":
-            skill_goal = (
-                "Synthesize a reusable failure-avoidance skill: explain the shared failure pattern, "
-                "warning signs, bad decisions to avoid, and safer alternative workflow."
-            )
-            skill_label = "failure avoidance"
-        else:
-            skill_goal = (
-                "Synthesize one reusable sequence-level skill that captures the common strategy "
-                "or caution across these hints."
-            )
-            skill_label = "reusable skill"
-
-        hints_json = json.dumps(
-            [
-                {"hint_id": idx, "episode_hint": hint}
-                for idx, hint in enumerate(candidate_hints)
-            ],
-            ensure_ascii=False,
-            indent=2,
-        )
-        prompt_text = f"""Aggregate multiple trajectory-level episode hints into ONE reusable guide-memory skill.
-
-Context:
-- Task description: {task_text or "(not available)"}
-- skill_type: {skill_type} ({skill_label})
-- episode_success_values: {list(episode_success_values)}
-- analysis_mode: {analysis_mode}
-- global_step: {global_step}
-
-Goal:
-{skill_goal}
-
-Important constraints:
-- Return a generalized skill for a task pattern, not a one-off instruction for the exact task.
-- Preserve useful agreement across hints and ignore one-off noise.
-- If hints disagree, prefer the guidance supported by more hints; mention uncertainty only when it changes action choice.
-- Avoid over-specific names, prices, IDs, or object attributes unless necessary for the reusable pattern.
-- Do not include embeddings, support counts, trajectory IDs, or metadata in the answer.
-- Keep skill_text concise but actionable, ideally one sentence.
-
-Candidate episode hints:
-{hints_json}
-
-Return ONLY valid JSON with exactly these fields:
-{{
-  "title": "short title",
-  "task_pattern": "short snake_case task family",
-  "applicability_text": "when this skill should be used",
-  "skill_text": "one aggregated reusable skill"
-}}
-"""
-        return build_prompt_dict(user_prompt=prompt_text)
-
-    def _parse_guide_skill_aggregation_response(self, response: str) -> Dict[str, object]:
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        if json_start == -1 or json_end <= json_start:
-            raise ValueError("No JSON object found in guide skill aggregation response.")
-        parsed = json.loads(response[json_start:json_end])
-        skill_text = str(
-            parsed.get("skill_text")
-            or parsed.get("episode_hint")
-            or parsed.get("skill")
-            or ""
-        ).strip()
-        if not skill_text:
-            raise ValueError("Guide skill aggregation response did not contain skill_text.")
-        return {
-            "title": str(parsed.get("title", "")).strip(),
-            "task_pattern": str(parsed.get("task_pattern", "")).strip(),
-            "applicability_text": str(
-                parsed.get("applicability_text")
-                or parsed.get("when_to_apply")
-                or ""
-            ).strip(),
-            "skill_text": skill_text,
-        }
-
     def _infer_task_description(self, steps: List[Dict[str, object]]) -> str:
         for step in steps:
             task_description = _clean_task_description(step.get("task_description", ""))
@@ -486,7 +347,6 @@ Return ONLY valid JSON with exactly these fields:
         max_hint_count = min(self.max_selected_steps_per_traj, len(candidate_step_indices))
         task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
 
-        summary_instruction = "Write a concise episode_summary."
         outcome_label = "unknown"
         if episode_success is not None:
             try:
@@ -501,10 +361,6 @@ Return ONLY valid JSON with exactly these fields:
                 "that made this trajectory work. Phrase it as a general skill for a task "
                 "pattern, not as instructions for only this exact task instance."
             )
-            outcome_instruction = (
-                "Because this is a successful episode, episode_hint should be a positive, reusable workflow "
-                "that explains how to complete similar tasks well."
-            )
         elif outcome_label == "failure":
             episode_hint_instruction = (
                 "Write one reusable episode_hint that explains why the trajectory failed and how to avoid "
@@ -512,19 +368,11 @@ Return ONLY valid JSON with exactly these fields:
                 "alternative workflow choices. Phrase it as a general avoidance skill for a task "
                 "pattern, not as a one-off lesson tied to this exact task instance."
             )
-            outcome_instruction = (
-                "Because this is a failed episode, episode_hint should focus on the failure cause and "
-                "concrete avoidance guidance, not on copying the failed actions."
-            )
         else:
             episode_hint_instruction = (
                 "Write one reusable episode_hint distilled from the trajectory. If it succeeded, extract "
                 "the successful workflow; if it failed, explain the failure cause and how to avoid it. "
                 "Make the hint broadly reusable across similar task patterns."
-            )
-            outcome_instruction = (
-                "Use episode_success and the trajectory evidence to decide whether episode_hint should "
-                "capture a success workflow or failure-avoidance guidance."
             )
         selection_instruction = (
             f"Provide concise, action-oriented decision guidance for at most {max_hint_count} critical step(s) "
@@ -533,25 +381,18 @@ Return ONLY valid JSON with exactly these fields:
         )
         prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
 
-You need to complete all three fields:
-1. {summary_instruction}
-2. {episode_hint_instruction}
-3. {selection_instruction}
+You need to complete both fields:
+1. {episode_hint_instruction}
+2. {selection_instruction}
 
 Important constraints:
 - Step indexing is 0-based: step 0 is the first step of the trajectory.
-- Use the task description together with the episode context to judge progress and mistakes.
-- {outcome_instruction}
-- Avoid over-specific names, prices, IDs, or object attributes unless they are necessary to describe the reusable pattern.
 - Use the full episode context to identify what each critical step should have done better.
-- Each step_hints value should be one short imperative sentence for the policy at that step.
+- Each step_hints value should be one short sentence for the policy at that step.
 - Write step_hints as policy-facing guidance, not as retrospective explanation of the trajectory.
-- Return only these top-level fields: episode_summary, episode_hint, step_hints.
-- The chosen steps are exactly the keys present in step_hints.
 
 Return format:
 {{
-  "episode_summary": "string",
   "episode_hint": "string",
   "step_hints": {{
     "0": "hint for step 0",
@@ -561,8 +402,7 @@ Return format:
 
 Episode context:
 - Task description: {task_description or "(not available)"}
-- episode_success: {episode_success}
-- interpreted_outcome: {outcome_label}
+- episode_success: {outcome_label}
 - Candidate step indices: {candidate_step_indices}
 - Interaction trajectory: {self._format_episode_steps(steps)}
 """

@@ -488,6 +488,7 @@ class RayPPOTrainer:
         self._copd_teacher_adv_last_weight = None
         self._copd_with_memory_last_enabled_state = None
         self._copd_failed_only_last_enabled_state = None
+        self._copd_analysis_last_enabled_state = None
         self._copd_with_memory_missing_skills_warned = False
         self._copd_teacher_signal_executor = None
         self.traj_collector = traj_collector
@@ -626,6 +627,24 @@ class RayPPOTrainer:
                 self.global_steps,
             )
             self._copd_with_memory_last_enabled_state = enabled
+        return enabled
+
+    def _is_copd_analysis_enabled(self) -> bool:
+        configured = OmegaConf.select(self.config, "algorithm.copd.enable_analysis")
+        if configured is None:
+            enabled = True
+        elif isinstance(configured, str):
+            enabled = configured.lower() in ("1", "true", "yes", "on")
+        else:
+            enabled = bool(configured)
+
+        if self._copd_analysis_last_enabled_state != enabled:
+            module_logger.info(
+                "COPD analysis and teacher signal construction are %s at global_step=%s.",
+                "enabled" if enabled else "disabled",
+                self.global_steps,
+            )
+            self._copd_analysis_last_enabled_state = enabled
         return enabled
 
     def _set_copd_use_with_memory(self, env_manager, use_with_memory: bool) -> None:
@@ -1009,10 +1028,40 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        rollout_extra_infos_dict=None,
+    ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        def _json_safe(value):
+            if isinstance(value, np.generic):
+                return value.item()
+            if torch.is_tensor(value):
+                return value.detach().cpu().item() if value.numel() == 1 else value.detach().cpu().tolist()
+            return value
+
+        def _sort_key(entry):
+            try:
+                return (
+                    int(entry.get("sample_id", 0)),
+                    int(entry.get("rollout_id", 0)),
+                    int(entry.get("step_num", 0)),
+                )
+            except (TypeError, ValueError):
+                step_id = str(entry.get("step_id", "0_0_0")).split("_")
+                padded = (step_id + ["0", "0", "0"])[:3]
+                try:
+                    return tuple(int(part) for part in padded)
+                except ValueError:
+                    return (0, 0, 0)
 
         n = len(inputs)
         base_data = {
@@ -1022,13 +1071,28 @@ class RayPPOTrainer:
             "step": [self.global_steps] * n,
         }
 
+        rollout_extra_infos_dict = rollout_extra_infos_dict or {}
+        for k, v in rollout_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
+
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
+        if all(key in base_data for key in ("sample_id", "rollout_id", "step_num")) and "step_id" not in base_data:
+            base_data["step_id"] = [
+                f"{int(base_data['sample_id'][i])}_{int(base_data['rollout_id'][i])}_{int(base_data['step_num'][i])}"
+                for i in range(n)
+            ]
+
+        entries = []
+        for i in range(n):
+            entries.append({k: _json_safe(v[i]) for k, v in base_data.items()})
+        entries.sort(key=_sort_key)
+
         with open(filename, "w") as f:
-            for i in range(n):
-                entry = {k: v[i] for k, v in base_data.items()}
+            for entry in entries:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         print(f"Dumped generations to {filename}")
@@ -1882,11 +1946,6 @@ class RayPPOTrainer:
             return
 
         episode_success = batch.non_tensor_batch.get("episode_success")
-        skill_aggregator = None
-        if bool(getattr(guide_memory, "aggregate_with_llm", False)):
-            analyzer = self._lazy_init_copd_analyzer()
-            skill_aggregator = getattr(analyzer, "aggregate_guide_skill_candidates", None)
-
         guide_metrics = guide_memory.update_from_episode_analysis(
             obs_texts=batch.non_tensor_batch.get("obs_text_base", batch.non_tensor_batch["obs_text"]),
             anchor_obs=batch.non_tensor_batch.get("anchor_obs"),
@@ -1897,7 +1956,6 @@ class RayPPOTrainer:
             global_step=self.global_steps,
             episode_success=episode_success,
             analysis_mode=analysis_mode,
-            skill_aggregator=skill_aggregator,
         )
         metrics.update(guide_metrics)
 
@@ -1963,6 +2021,29 @@ class RayPPOTrainer:
         batch.batch["teacher_signal_mask"] = zero_critical_mask.clone()
         traj_uids = batch.non_tensor_batch.get("traj_uid", [])
         num_trajectories = len(set(traj_uids)) if len(traj_uids) > 0 else 0
+
+        if not self._is_copd_analysis_enabled():
+            module_logger.info(
+                "Skipping COPD analysis and teacher signal construction for batch_size=%s, num_trajectories=%s.",
+                batch_size,
+                num_trajectories,
+            )
+            batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            batch.batch["critical_step_mask"] = zero_critical_mask
+            metrics["copd/analysis_enabled"] = 0.0
+            metrics["copd/analysis_disabled"] = 1.0
+            metrics["copd/analysis_num_requests"] = 0.0
+            metrics["copd/analysis_num_workers"] = 0.0
+            metrics["copd/critical_step_ratio"] = 0.0
+            metrics["copd/teacher_batch_size"] = 0.0
+            metrics["copd/teacher_available"] = 0.0
+            metrics["copd/teacher_skipped_analysis_disabled"] = 1.0
+            metrics["copd/guide_memory/skill_guided_step_ratio"] = 0.0
+            metrics["copd/guide_memory/skills_retrieved"] = 0.0
+            return batch
+
+        metrics["copd/analysis_enabled"] = 1.0
+        metrics["copd/analysis_disabled"] = 0.0
         configured_failed_only = bool(OmegaConf.select(self.config, "algorithm.copd.failed_only"))
         failed_only_after_steps = self._get_copd_failed_only_after_steps()
         failed_only = self._should_copd_analyze_failed_only()
@@ -2554,7 +2635,9 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     copd_teacher_future = None
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
-                        copd_teacher_adv_enabled = self._is_copd_teacher_adv_enabled()
+                        copd_teacher_schedule_enabled = self._is_copd_teacher_adv_enabled()
+                        copd_analysis_enabled = self._is_copd_analysis_enabled()
+                        copd_teacher_adv_enabled = copd_teacher_schedule_enabled and copd_analysis_enabled
                         copd_with_memory_enabled = self._should_copd_use_with_memory_rollout()
                         self._set_copd_use_with_memory(self.envs, use_with_memory=copd_with_memory_enabled)
                     # generate a batch
@@ -2604,13 +2687,19 @@ class RayPPOTrainer:
                         batch.batch['step_rewards'] = step_rewards_tensor
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
                         metrics["copd/teacher_enabled"] = 1.0 if copd_teacher_adv_enabled else 0.0
-                        metrics["copd/teacher_disabled_by_schedule"] = 0.0 if copd_teacher_adv_enabled else 1.0
-                        metrics["copd/with_memory_enabled"] = 1.0 if copd_with_memory_enabled else 0.0
-                        copd_teacher_future = self._lazy_init_copd_teacher_signal_executor().submit(
-                            self._prepare_copd_teacher_signals_async_task,
-                            self._build_copd_teacher_signal_snapshot(batch),
-                            copd_teacher_adv_enabled,
+                        metrics["copd/teacher_disabled_by_schedule"] = 0.0 if copd_teacher_schedule_enabled else 1.0
+                        metrics["copd/teacher_disabled_by_analysis"] = (
+                            1.0 if copd_teacher_schedule_enabled and not copd_analysis_enabled else 0.0
                         )
+                        metrics["copd/analysis_enabled"] = 1.0 if copd_analysis_enabled else 0.0
+                        metrics["copd/analysis_disabled"] = 0.0 if copd_analysis_enabled else 1.0
+                        metrics["copd/with_memory_enabled"] = 1.0 if copd_with_memory_enabled else 0.0
+                        if copd_analysis_enabled:
+                            copd_teacher_future = self._lazy_init_copd_teacher_signal_executor().submit(
+                                self._prepare_copd_teacher_signals_async_task,
+                                self._build_copd_teacher_signal_snapshot(batch),
+                                copd_teacher_adv_enabled,
+                            )
                     
                     batch = adjust_batch(
                         self.config,
@@ -2692,20 +2781,32 @@ class RayPPOTrainer:
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
                         with _timer("copd_teacher", timing_raw):
-                            try:
-                                teacher_signal_batch, teacher_signal_metrics = copd_teacher_future.result()
-                                metrics.update(teacher_signal_metrics)
-                                batch = self._merge_async_copd_teacher_signals(
-                                    batch=batch,
-                                    teacher_signal_batch=teacher_signal_batch,
+                            if copd_teacher_future is None:
+                                module_logger.info(
+                                    "COPD analysis is disabled; using zero teacher signals for this batch."
                                 )
-                            except Exception as exc:
-                                module_logger.warning(
-                                    "Asynchronous COPD teacher signal preparation failed; falling back to zero teacher signals for this batch: %s",
-                                    exc,
-                                )
-                                batch.non_tensor_batch.pop("_batch_source_idx", None)
                                 batch = self._set_zero_copd_teacher_signals(batch=batch, metrics=metrics)
+                                metrics["copd/analysis_enabled"] = 0.0
+                                metrics["copd/analysis_disabled"] = 1.0
+                                metrics["copd/analysis_num_requests"] = 0.0
+                                metrics["copd/analysis_num_workers"] = 0.0
+                                metrics["copd/teacher_skipped_analysis_disabled"] = 1.0
+                                batch.non_tensor_batch.pop("_batch_source_idx", None)
+                            else:
+                                try:
+                                    teacher_signal_batch, teacher_signal_metrics = copd_teacher_future.result()
+                                    metrics.update(teacher_signal_metrics)
+                                    batch = self._merge_async_copd_teacher_signals(
+                                        batch=batch,
+                                        teacher_signal_batch=teacher_signal_batch,
+                                    )
+                                except Exception as exc:
+                                    module_logger.warning(
+                                        "Asynchronous COPD teacher signal preparation failed; falling back to zero teacher signals for this batch: %s",
+                                        exc,
+                                    )
+                                    batch.non_tensor_batch.pop("_batch_source_idx", None)
+                                    batch = self._set_zero_copd_teacher_signals(batch=batch, metrics=metrics)
 
                     with _timer("adv", timing_raw):
                         # we combine with rule-based rm
@@ -2798,12 +2899,25 @@ class RayPPOTrainer:
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            rollout_extra_infos_dict = {
+                                key: batch.non_tensor_batch[key]
+                                for key in (
+                                    "sample_id",
+                                    "rollout_id",
+                                    "step_num",
+                                    "step_id",
+                                    "uid",
+                                    "traj_uid",
+                                )
+                                if key in batch.non_tensor_batch
+                            }
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
                                 scores=scores,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
+                                rollout_extra_infos_dict=rollout_extra_infos_dict,
                             )
 
                     # validate

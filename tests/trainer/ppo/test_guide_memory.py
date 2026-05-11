@@ -1,6 +1,6 @@
 from agent_system.memory.guide_memory import (
     COPDGuideMemory,
-    _infer_task_pattern,
+    _cosine_similarity_matrix,
     build_augmented_observation_text,
 )
 
@@ -26,7 +26,6 @@ def _make_memory(promote_min_support=1, **overrides):
         "embedding_batch_size": 4,
         "promote_min_support": promote_min_support,
         "merge_task_similarity_thresh": 0.5,
-        "merge_skill_similarity_thresh": 0.8,
         "max_skills": 8,
         "max_skill_chars": 256,
     }
@@ -53,6 +52,29 @@ def _update_once(memory, *, task_prompt=PROMPT, global_step=1):
         episode_success=[0.0, 0.0],
         analysis_mode="teacher_bootstrap",
     )
+
+
+def test_cosine_similarity_matrix_scores_multiple_queries():
+    scores = _cosine_similarity_matrix(
+        queries=[
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        candidates=[
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ],
+    )
+
+    assert len(scores) == 2
+    assert len(scores[0]) == 3
+    assert abs(scores[0][0] - 1.0) < 1e-6
+    assert abs(scores[0][1]) < 1e-6
+    assert abs(scores[1][0]) < 1e-6
+    assert abs(scores[1][1] - 1.0) < 1e-6
+    assert scores[0][2] > 0.7
+    assert scores[1][2] > 0.7
 
 
 def test_episode_hint_becomes_sequence_skill_but_step_hint_does_not():
@@ -87,6 +109,47 @@ def test_pending_skill_is_not_retrieved_until_promoted():
     )
 
 
+def test_same_task_text_does_not_bypass_embedding_merge_threshold():
+    memory = _make_memory(
+        merge_task_similarity_thresh=1.1,
+    )
+
+    memory.update_from_episode_analysis(
+        obs_texts=[PROMPT],
+        anchor_obs=["Search page."],
+        traj_uids=["traj-1"],
+        step_indices=[0],
+        critical_mask=[True],
+        episode_analysis={
+            "traj-1": {
+                "episode_hint": "Search broadly using the product noun first.",
+            },
+        },
+        global_step=1,
+        episode_success=[0.0],
+        analysis_mode="teacher_bootstrap",
+    )
+    metrics = memory.update_from_episode_analysis(
+        obs_texts=[PROMPT],
+        anchor_obs=["Search page."],
+        traj_uids=["traj-2"],
+        step_indices=[0],
+        critical_mask=[True],
+        episode_analysis={
+            "traj-2": {
+                "episode_hint": "Avoid buying until the product page confirms every constraint.",
+            },
+        },
+        global_step=2,
+        episode_success=[0.0],
+        analysis_mode="teacher_bootstrap",
+    )
+
+    assert metrics["copd/guide_memory/skill_candidates_merged"] == 0.0
+    assert metrics["copd/guide_memory/skill_candidates_added"] == 1.0
+    assert len(memory._skills) == 2
+
+
 def test_semantic_task_retrieval_filters_by_similarity():
     memory = _make_memory()
     _update_once(memory)
@@ -107,10 +170,18 @@ def test_semantic_task_retrieval_filters_by_similarity():
     assert unrelated["skills"] == []
 
 
-def test_task_pattern_keeps_shopping_and_embodied_find_tasks_separate():
-    assert _infer_task_pattern("find a red mug under 20 dollars") == "constrained_product_search"
-    assert _infer_task_pattern("find the mug in the kitchen") == "object_location_and_examination"
-    assert _infer_task_pattern("look at the bowl under the desklamp") == "look_at_object_in_light"
+def test_guide_memory_records_merge_and_retrieval_timing_metrics():
+    memory = _make_memory()
+
+    update_metrics = _update_once(memory)
+    assert update_metrics["copd/guide_memory/skill_merge_time_sec"] >= 0.0
+    assert update_metrics["copd/guide_memory/skill_merge_time_count"] == 1.0
+    assert update_metrics["copd/guide_memory/skill_retrieval_time_count"] == 0.0
+
+    memory.retrieve_for_observation(observation=PROMPT, global_step=2)
+    snapshot_metrics = memory.snapshot_metrics(prefix="copd/guide_memory")
+    assert snapshot_metrics["copd/guide_memory/skill_retrieval_time_sec_last"] >= 0.0
+    assert snapshot_metrics["copd/guide_memory/skill_retrieval_time_count"] == 1.0
 
 
 def test_same_batch_same_task_candidates_are_aggregated_before_storage():
@@ -145,55 +216,99 @@ def test_same_batch_same_task_candidates_are_aggregated_before_storage():
     assert memory._skills[0].status == "active"
 
 
-def test_same_batch_candidates_can_be_synthesized_by_llm_aggregator():
+def test_batch_history_merge_uses_similarity_matrix():
+    from agent_system.memory import guide_memory as guide_memory_module
+
+    memory = _make_memory(merge_task_similarity_thresh=0.0)
+    memory.update_from_episode_analysis(
+        obs_texts=[PROMPT, PROMPT],
+        anchor_obs=["Search page.", "Search page."],
+        traj_uids=["traj-success", "traj-failure"],
+        step_indices=[0, 0],
+        critical_mask=[True, True],
+        episode_analysis={
+            "traj-success": {
+                "episode_hint": "Search by required attributes before selecting the item.",
+            },
+            "traj-failure": {
+                "episode_hint": "Avoid selecting a result before checking every constraint.",
+            },
+        },
+        global_step=1,
+        episode_success=[1.0, 0.0],
+        analysis_mode="teacher_bootstrap",
+    )
+
+    matrix_calls = []
+    original_matrix = guide_memory_module._cosine_similarity_matrix
+
+    def counted_matrix(queries, candidates):
+        matrix_calls.append((len(queries), len(candidates)))
+        return original_matrix(queries, candidates)
+
+    guide_memory_module._cosine_similarity_matrix = counted_matrix
+    try:
+        metrics = memory.update_from_episode_analysis(
+            obs_texts=[PROMPT, PROMPT],
+            anchor_obs=["Search page.", "Search page."],
+            traj_uids=["traj-success-2", "traj-failure-2"],
+            step_indices=[0, 0],
+            critical_mask=[True, True],
+            episode_analysis={
+                "traj-success-2": {
+                    "episode_hint": "Compare required attributes before selecting the item.",
+                },
+                "traj-failure-2": {
+                    "episode_hint": "Avoid buying before confirming every product constraint.",
+                },
+            },
+            global_step=2,
+            episode_success=[1.0, 0.0],
+            analysis_mode="teacher_bootstrap",
+        )
+    finally:
+        guide_memory_module._cosine_similarity_matrix = original_matrix
+
+    assert metrics["copd/guide_memory/skill_candidates_merged"] == 2.0
+    assert any(query_count == 2 and candidate_count >= 2 for query_count, candidate_count in matrix_calls)
+
+
+def test_batch_candidates_are_clustered_by_task_skill_embedding():
     memory = _make_memory(
         promote_min_support=2,
-        aggregate_with_llm=True,
-        aggregate_min_group_size=2,
+        batch_cluster_similarity_thresh=0.2,
     )
-    aggregator_calls = []
-
-    def fake_aggregator(**kwargs):
-        aggregator_calls.append(kwargs)
-        return {
-            "title": "Verify product constraints",
-            "task_pattern": "constrained_product_search",
-            "applicability_text": "Use for shopping tasks with hard product constraints.",
-            "skill_text": "Verify the product category, color, and price before selecting or buying an item.",
-        }
+    related_prompt = PROMPT.replace(
+        "find a red mug under 20 dollars",
+        "find a blue cup under 25 dollars",
+    )
 
     metrics = memory.update_from_episode_analysis(
-        obs_texts=[PROMPT, PROMPT],
+        obs_texts=[PROMPT, related_prompt],
         anchor_obs=["Search page.", "Search page."],
         traj_uids=["traj-1", "traj-2"],
         step_indices=[0, 0],
         critical_mask=[True, True],
         episode_analysis={
             "traj-1": {
-                "episode_hint": "Avoid clicking before checking that the item is red and below the price limit.",
+                "episode_hint": "Avoid clicking before checking product constraints.",
             },
             "traj-2": {
-                "episode_hint": "Avoid buying until the product page confirms color, price, and item type.",
+                "episode_hint": "Avoid buying before checking product constraints.",
             },
         },
         global_step=1,
         episode_success=[0.0, 0.0],
         analysis_mode="teacher_bootstrap",
-        skill_aggregator=fake_aggregator,
     )
 
-    assert len(aggregator_calls) == 1
-    assert aggregator_calls[0]["skill_type"] == "failure_avoidance"
-    assert len(aggregator_calls[0]["candidate_hints"]) == 2
-    assert metrics["copd/guide_memory/batch_llm_aggregation_count"] == 1.0
-    assert metrics["copd/guide_memory/batch_llm_aggregation_error_count"] == 0.0
+    assert metrics["copd/guide_memory/batch_embedding_aggregation_count"] == 1.0
     assert len(memory._skills) == 1
     assert memory._skills[0].support_count == 2
-    assert memory._skills[0].skill_text == (
-        "Verify the product category, color, and price before selecting or buying an item."
-    )
-    assert memory._skills[0].metadata["aggregation_used"] is True
-    assert len(memory._skills[0].metadata["candidate_hints"]) == 2
+    assert memory._skills[0].skill_text in {
+        "Avoid clicking before checking product constraints.",
+        "Avoid buying before checking product constraints.",
+    }
 
 
 def test_retrieval_returns_one_success_and_one_failure_skill_for_same_task():
@@ -283,6 +398,26 @@ def test_batch_retrieval_deduplicates_identical_task_queries():
     assert "find a red mug under 20 dollars" in embed_calls[0][0]
 
 
+def test_embedding_cache_uses_configured_device_when_torch_available():
+    from agent_system.memory import guide_memory as guide_memory_module
+
+    torch = guide_memory_module._get_torch_module()
+    if torch is None:
+        return
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    memory = _make_memory(embedding_device=device)
+    embedding = memory._embed_task("find a red mug under 20 dollars")
+
+    assert torch.is_tensor(embedding)
+    assert embedding.device == torch.device(device)
+    assert memory._text_embedding_cache
+    assert all(
+        torch.is_tensor(cached_embedding) and cached_embedding.device == torch.device(device)
+        for cached_embedding in memory._text_embedding_cache.values()
+    )
+
+
 def test_skill_snapshot_does_not_persist_embeddings():
     import json
     import os
@@ -301,8 +436,20 @@ def test_skill_snapshot_does_not_persist_embeddings():
     serialized_skill = payload["skills"][0]
     assert "task_embedding" not in serialized_skill
     assert "retrieval_embedding" not in serialized_skill
-    assert "retrieval_text" in serialized_skill
-    assert "evidence_examples" in serialized_skill
+    assert serialized_skill["retrieval_text"] == (
+        "find a red mug under 20 dollars Search with the key product attributes before clicking an item."
+    )
+    assert set(serialized_skill) == {
+        "skill_id",
+        "task_text",
+        "skill_text",
+        "skill_type",
+        "retrieval_text",
+        "support_count",
+        "status",
+        "created_step",
+        "last_updated_step",
+    }
 
 
 def test_augmented_observation_injects_skills_and_step_hint():

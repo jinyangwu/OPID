@@ -40,13 +40,15 @@ def test_copd_openai_prompt_uses_step_hints_as_selected_steps():
 
     assert "selected_steps" not in user_prompt
     assert "overall_hint" not in user_prompt
+    assert "episode_summary" not in user_prompt
     assert "episode_hint" in user_prompt
-    assert "Return only these top-level fields" in user_prompt
-    assert "The chosen steps are exactly the keys present in step_hints" in user_prompt
+    assert "Return format:" in user_prompt
     assert "Task description:" in user_prompt
     assert "find a red mug under 20 dollars" in user_prompt
     assert "successful workflow" in user_prompt
-    assert "interpreted_outcome: success" in user_prompt
+    assert "episode_success: success" in user_prompt
+    assert "interpreted_outcome" not in user_prompt
+    assert "Because this is a successful episode" not in user_prompt
 
 
 def test_copd_prompt_for_failed_episode_emphasizes_avoidance():
@@ -61,8 +63,9 @@ def test_copd_prompt_for_failed_episode_emphasizes_avoidance():
 
     assert "why the trajectory failed" in user_prompt
     assert "avoid that failure pattern" in user_prompt
-    assert "failed episode" in user_prompt
-    assert "interpreted_outcome: failure" in user_prompt
+    assert "episode_success: failure" in user_prompt
+    assert "interpreted_outcome" not in user_prompt
+    assert "Because this is a failed episode" not in user_prompt
 
 
 def test_copd_parse_omits_legacy_selected_steps_field():
