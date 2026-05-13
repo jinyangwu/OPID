@@ -32,7 +32,7 @@ _TASK_PATTERNS = (
 
 _HASHING_EMBEDDING_ALIASES = {"", "none", "null", "hash", "hashing", "hashing-fallback"}
 _EMBEDDING_DEVICE_AUTO_ALIASES = {"", "auto", "none", "null"}
-DEFAULT_EMBEDDING_MODEL_PATH = "/raid3/data/GTPO/MODELS/Qwen3-Embedding-0.6B"
+DEFAULT_EMBEDDING_MODEL_NAME = "Qwen3-Embedding-0.6B"
 SUCCESS_WORKFLOW = "success_workflow"
 FAILURE_AVOIDANCE = "failure_avoidance"
 UNKNOWN_SKILL_TYPE = "unknown"
@@ -267,9 +267,9 @@ def build_augmented_observation_text(
     *,
     observation: str,
     skills: Optional[Sequence[str]] = None,
-    step_hint: str = "",
+    episode_hint: str = "",
 ) -> str:
-    """Insert OPD teacher-only context while preserving the existing step-hint path."""
+    """Insert episode-level OPD teacher context into an observation prompt."""
 
     def _format_guidance_section(title: str, instruction: str, body: Any) -> str:
         body_text = str(body).strip()
@@ -311,15 +311,15 @@ def build_augmented_observation_text(
             )
         )
 
-    if step_hint:
+    if episode_hint:
         sections.append(
             _format_guidance_section(
-                "Current-Step Decision Guidance",
+                "Episode-Level Guidance",
                 (
-                    "This is policy-facing advice for the current decision point. "
-                    "Use it to guide your reasoning and select the next admissible action"
+                    "Use this sequence-level lesson as reusable guidance for every "
+                    "decision in the current episode"
                 ),
-                step_hint,
+                episode_hint,
             )
         )
 
@@ -354,8 +354,7 @@ class COPDGuideMemory:
     Online sequence-level skill memory for COPD teacher prompts.
 
     ``episode_hint`` becomes a reusable skill candidate keyed by the trajectory
-    task. ``step_hints`` remain direct current-step teacher guidance and are not
-    stored in this memory.
+    task.
     """
 
     _embedding_model_cache: Dict[str, Any] = {}
@@ -365,13 +364,12 @@ class COPDGuideMemory:
         self.enabled = bool(config.get("enable", False))
         self.top_k = int(config.get("top_k", 2))
         self.max_per_skill_type = int(config.get("max_per_skill_type", 1))
-        self.similarity_threshold = float(config.get("similarity_threshold", 0.3))
         self.dedupe_skill_similarity_thresh = float(config.get("dedupe_skill_similarity_thresh", 0.88))
         self.enable_batch_task_aggregation = bool(config.get("enable_batch_task_aggregation", True))
-        self.embedding_model_path = str(
-            config.get("embedding_model_path", DEFAULT_EMBEDDING_MODEL_PATH)
-            or DEFAULT_EMBEDDING_MODEL_PATH
-        )
+        embedding_model_path = config.get("embedding_model_path")
+        if not embedding_model_path:
+            embedding_model_path = os.path.join(os.environ["MODELS_ROOT"], DEFAULT_EMBEDDING_MODEL_NAME)
+        self.embedding_model_path = str(embedding_model_path)
         self.embedding_device = str(config.get("embedding_device", "") or "").strip()
         self.embedding_batch_size = max(int(config.get("embedding_batch_size", 64)), 1)
         self.hash_embedding_dim = int(config.get("hash_embedding_dim", 384))
@@ -383,9 +381,6 @@ class COPDGuideMemory:
             )
         )
         self.max_skills = int(config.get("max_skills", 128))
-        self.max_task_chars = int(config.get("max_task_chars", 256))
-        self.max_skill_chars = int(config.get("max_skill_chars", 256))
-        self.max_retrieval_chars = int(config.get("max_retrieval_chars", 768))
         self.max_embedding_cache_entries = int(config.get("max_embedding_cache_entries", 4096))
         self.batch_cluster_similarity_thresh = float(
             config.get(
@@ -428,10 +423,10 @@ class COPDGuideMemory:
         self._retrieval_time_count += 1
 
     def _task_text_from_observation(self, observation: Any) -> str:
-        return _normalize_text(extract_task_query(observation), lowercase=False, max_chars=self.max_task_chars)
+        return _normalize_text(extract_task_query(observation), lowercase=False)
 
     def _normalize_skill_text(self, skill_text: Any) -> str:
-        return _normalize_text(skill_text, lowercase=False, max_chars=self.max_skill_chars)
+        return _normalize_text(skill_text, lowercase=False)
 
     def _build_retrieval_text(
         self,
@@ -440,16 +435,15 @@ class COPDGuideMemory:
         task_text: str,
     ) -> str:
         return _normalize_text(
-            f"{task_text} {skill_text}",
+            f"TASK: {task_text}\nSKILL: {skill_text}",
             lowercase=False,
-            max_chars=self.max_retrieval_chars,
         )
 
     def _build_query_retrieval_text(self, task_text: str) -> str:
-        return _normalize_text(task_text, lowercase=False, max_chars=self.max_retrieval_chars)
+        return _normalize_text(task_text, lowercase=False)
 
     def _record_retrieval_text(self, record: GuideSkillRecord) -> str:
-        return _normalize_text(record.retrieval_text, lowercase=False, max_chars=self.max_retrieval_chars)
+        return _normalize_text(record.retrieval_text, lowercase=False)
 
     def _skill_type_from_success(self, episode_success: Optional[float]) -> str:
         if episode_success is None:
@@ -504,7 +498,7 @@ class COPDGuideMemory:
         )
 
     def _embedding_key(self, text: Any) -> str:
-        return _normalize_text(text, lowercase=True, max_chars=self.max_retrieval_chars)
+        return _normalize_text(text, lowercase=True)
 
     def _remember_embedding(self, key: str, embedding: Any) -> None:
         if not key or self.max_embedding_cache_entries <= 0:
@@ -671,7 +665,7 @@ class COPDGuideMemory:
         matched_record: Optional[GuideSkillRecord] = None,
         match_precomputed: bool = False,
     ) -> Tuple[bool, bool]:
-        normalized_task = _normalize_text(task_text, lowercase=False, max_chars=self.max_task_chars)
+        normalized_task = _normalize_text(task_text, lowercase=False)
         normalized_skill = self._normalize_skill_text(skill_text)
         if not normalized_task or not normalized_skill:
             return False, False
@@ -729,9 +723,8 @@ class COPDGuideMemory:
 
     def _build_candidate_cluster_text(self, candidate: Dict[str, Any]) -> str:
         return _normalize_text(
-            f"{candidate.get('task_text', '')} {candidate.get('skill_text', '')}",
+            f"TASK: {candidate.get('task_text', '')}\nSKILL: {candidate.get('skill_text', '')}",
             lowercase=False,
-            max_chars=self.max_retrieval_chars,
         )
 
     def _build_clustered_candidate(
@@ -813,18 +806,16 @@ class COPDGuideMemory:
         records: Sequence[GuideSkillRecord],
         similarities: Sequence[float],
         top_k: Optional[int] = None,
-        similarity_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
         result = {
             "task_query": task_text,
             "skills": [],
             "skill_records": [],
         }
-        threshold = self.similarity_threshold if similarity_threshold is None else float(similarity_threshold)
         scored_records = [
             (float(similarity), record)
             for record, similarity in zip(records, similarities)
-            if record.status == "active" and float(similarity) >= threshold
+            if record.status == "active"
         ]
         scored_records.sort(
             key=lambda item: (
@@ -864,7 +855,6 @@ class COPDGuideMemory:
         query_embedding: Any,
         global_step: Optional[int] = None,
         top_k: Optional[int] = None,
-        similarity_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
         result = {
             "task_query": task_text,
@@ -881,7 +871,6 @@ class COPDGuideMemory:
             records=active_records,
             similarities=similarities,
             top_k=top_k,
-            similarity_threshold=similarity_threshold,
         )
 
     def retrieve_guides(
@@ -890,12 +879,11 @@ class COPDGuideMemory:
         task_query: Any,
         global_step: Optional[int] = None,
         top_k: Optional[int] = None,
-        similarity_threshold: Optional[float] = None,
         **_: Any,
     ) -> Dict[str, Any]:
         started = time.perf_counter()
         try:
-            task_text = _normalize_text(task_query, lowercase=False, max_chars=self.max_task_chars)
+            task_text = _normalize_text(task_query, lowercase=False)
             if not self.enabled or not task_text:
                 return {
                     "task_query": task_text,
@@ -909,7 +897,6 @@ class COPDGuideMemory:
                 query_embedding=query_embedding,
                 global_step=global_step,
                 top_k=top_k,
-                similarity_threshold=similarity_threshold,
             )
         finally:
             self._record_retrieval_time(time.perf_counter() - started)
@@ -920,13 +907,12 @@ class COPDGuideMemory:
         task_queries: Sequence[Any],
         global_step: Optional[int] = None,
         top_k: Optional[int] = None,
-        similarity_threshold: Optional[float] = None,
         **_: Any,
     ) -> List[Dict[str, Any]]:
         started = time.perf_counter()
         try:
             task_texts = [
-                _normalize_text(task_query, lowercase=False, max_chars=self.max_task_chars)
+                _normalize_text(task_query, lowercase=False)
                 for task_query in task_queries
             ]
             results = [
@@ -963,7 +949,6 @@ class COPDGuideMemory:
                     records=active_records,
                     similarities=similarities,
                     top_k=top_k,
-                    similarity_threshold=similarity_threshold,
                 )
             return results
         finally:
@@ -1031,13 +1016,12 @@ class COPDGuideMemory:
         *,
         observation: str,
         skills: Optional[Sequence[str]] = None,
-        hindsight_hint: str = "",
-        step_hint: str = "",
+        episode_hint: str = "",
     ) -> str:
         return build_augmented_observation_text(
             observation=observation,
             skills=skills or [],
-            step_hint=step_hint or hindsight_hint,
+            episode_hint=episode_hint,
         )
 
     def format_for_rollout_prompt(self, *, skills: Sequence[str], **_: Any) -> str:
@@ -1091,18 +1075,15 @@ class COPDGuideMemory:
         for traj_uid, sample_indices in traj_to_indices.items():
             if not sample_indices:
                 continue
+            if traj_uid not in episode_analysis:
+                continue
             representative_idx = min(sample_indices, key=lambda idx: step_indices_list[idx])
-            analysis = episode_analysis.get(traj_uid, {})
+            analysis = episode_analysis[traj_uid]
             task_text = _normalize_text(
                 analysis.get("task_description") or self._task_text_from_observation(obs_texts[representative_idx]),
                 lowercase=False,
-                max_chars=self.max_task_chars,
             )
-            skill_text = str(
-                analysis.get("episode_hint")
-                or analysis.get("overall_hint")
-                or ""
-            ).strip()
+            skill_text = str(analysis["episode_hint"]).strip()
             if not skill_text:
                 continue
 

@@ -19,7 +19,6 @@ def _make_memory(promote_min_support=1, **overrides):
         "enable": True,
         "top_k": 2,
         "max_per_skill_type": 1,
-        "similarity_threshold": 0.2,
         "dedupe_skill_similarity_thresh": 0.88,
         "enable_batch_task_aggregation": True,
         "embedding_model_path": "hashing",
@@ -27,7 +26,6 @@ def _make_memory(promote_min_support=1, **overrides):
         "promote_min_support": promote_min_support,
         "merge_task_similarity_thresh": 0.5,
         "max_skills": 8,
-        "max_skill_chars": 256,
     }
     config.update(overrides)
     return COPDGuideMemory(config)
@@ -150,7 +148,7 @@ def test_same_task_text_does_not_bypass_embedding_merge_threshold():
     assert len(memory._skills) == 2
 
 
-def test_semantic_task_retrieval_filters_by_similarity():
+def test_semantic_task_retrieval_ranks_by_similarity_without_threshold():
     memory = _make_memory()
     _update_once(memory)
 
@@ -167,7 +165,7 @@ def test_semantic_task_retrieval_filters_by_similarity():
     assert similar["skills"][0].startswith(
         "Failure avoidance: Search with the key product attributes before clicking an item."
     )
-    assert unrelated["skills"] == []
+    assert len(unrelated["skills"]) == 1
 
 
 def test_guide_memory_records_merge_and_retrieval_timing_metrics():
@@ -437,7 +435,7 @@ def test_skill_snapshot_does_not_persist_embeddings():
     assert "task_embedding" not in serialized_skill
     assert "retrieval_embedding" not in serialized_skill
     assert serialized_skill["retrieval_text"] == (
-        "find a red mug under 20 dollars Search with the key product attributes before clicking an item."
+        "TASK: find a red mug under 20 dollars SKILL: Search with the key product attributes before clicking an item."
     )
     assert set(serialized_skill) == {
         "skill_id",
@@ -452,26 +450,26 @@ def test_skill_snapshot_does_not_persist_embeddings():
     }
 
 
-def test_augmented_observation_injects_skills_and_step_hint():
+def test_augmented_observation_injects_skills_and_episode_hint():
     augmented = build_augmented_observation_text(
         observation=PROMPT,
         skills=["Search with the key product attributes before clicking an item."],
-        step_hint="Check price and color before selecting the product.",
+        episode_hint="Check price and color before selecting the product.",
     )
 
     assert "Retrieved Reusable Skills" in augmented
-    assert "Current-Step Decision Guidance" in augmented
+    assert "Episode-Level Guidance" in augmented
     assert augmented.index("Retrieved Reusable Skills") < augmented.index("Now it's your turn")
     assert "Check price and color before selecting the product." in augmented
 
 
-def test_augmented_observation_step_hint_only_keeps_step_hint_path():
+def test_augmented_observation_episode_hint_only_keeps_episode_guidance_path():
     augmented = build_augmented_observation_text(
         observation=PROMPT,
         skills=[],
-        step_hint="Check price and color before selecting the product.",
+        episode_hint="Check price and color before selecting the product.",
     )
 
     assert "Retrieved Reusable Skills" not in augmented
-    assert "Current-Step Decision Guidance" in augmented
+    assert "Episode-Level Guidance" in augmented
     assert "Check price and color before selecting the product." in augmented

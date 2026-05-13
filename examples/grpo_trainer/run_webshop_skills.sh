@@ -10,6 +10,7 @@ export VLLM_LOGGING_LEVEL=DEBUG
 # export WANDB_API_KEY=
 export WANDB_NAME="webshop_grpo_qwen2.5_7b_sft_skills_dynamic"
 
+MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
 MODEL_PATH=/raid3/data/GTPO/Webshop-7B-SFT
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
@@ -69,7 +70,7 @@ python3 -m verl.trainer.main_ppo \
     +env.use_skills_only_memory=True \
     +env.skills_only_memory.skills_json_path=memory_data/webshop/claude_style_skills.json \
     +env.skills_only_memory.retrieval_mode=embedding \
-    +env.skills_only_memory.embedding_model_path=/raid3/data/GTPO/Qwen3-Embedding-0.6B \
+    +env.skills_only_memory.embedding_model_path=$MODELS_ROOT/Qwen3-Embedding-0.6B \
     +env.skills_only_memory.top_k=15 \
     +env.skills_only_memory.task_specific_top_k=5 \
     +env.skills_only_memory.enable_dynamic_update=True \

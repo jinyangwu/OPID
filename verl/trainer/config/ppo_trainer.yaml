@@ -256,7 +256,7 @@ algorithm:
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
   copd:
-    step_advantage_w: 1.0
+    step_advantage_w: 0.0 # COPD uses episode-level advantage only.
     teacher_advantage_w: 1.0
     opd_start_after_steps: null # null -> enable COPD teacher/OPD signal from the first training step; otherwise enable after this many completed steps
     teacher_advantage_w_start: null # null -> keep teacher_advantage_w constant; otherwise linearly ramp from start to teacher_advantage_w
@@ -267,16 +267,11 @@ algorithm:
     enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
     similarity_thresh: 0.95
-    selector: "llm" # "stats" or "llm"
+    selector: "llm"
     failed_only: False # if True, analyze and apply teacher OPD only on failed episodes
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
-    enhance_step_hint_only: False # if True, teacher prompts add only the selected step hint, without episode summary or guide memory
-    stats_min_group_size: 2
-    stats_var_quantile: 0.75
-    stats_topk_per_traj: 1
-    stats_below_group_mean_only: True
-    analysis_backend: "azure" # "heuristic", "azure", or "google"
+    analysis_backend: "openai"
     analysis_num_workers: 8
     analysis_max_history_steps: 15
     analysis_max_completion_tokens: 1024
@@ -284,7 +279,7 @@ algorithm:
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/copd_analysis
     save_augmented_observations: True
     augmented_observation_dump_dir: null # null -> ${trainer.default_local_dir}/copd_augmented_observations
-    save_state_group_metrics: True
+    save_state_group_metrics: False
     state_group_dump_dir: null # null -> ${trainer.default_local_dir}/copd_state_group
     normalize_teacher_adv: False
     clip_teacher_adv: null
@@ -334,18 +329,14 @@ env:
     enable: False
     top_k: 2
     max_per_skill_type: 1
-    similarity_threshold: 0.3
     dedupe_skill_similarity_thresh: 0.88
     enable_batch_task_aggregation: True
-    embedding_model_path: /raid3/data/GTPO/MODELS/Qwen3-Embedding-0.6B # falls back to hashing if unavailable
+    embedding_model_path: ${oc.env:MODELS_ROOT}/Qwen3-Embedding-0.6B
     embedding_batch_size: 64
     embedding_device: null # null -> sentence-transformers auto device
     promote_min_support: 2
     merge_task_similarity_thresh: 0.85
     max_skills: 128
-    max_task_chars: 256
-    max_skill_chars: 256
-    max_retrieval_chars: 768
     max_embedding_cache_entries: 4096
     batch_cluster_similarity_thresh: 0.85
     dump_dir: null # null -> ${trainer.default_local_dir}/guide_memory

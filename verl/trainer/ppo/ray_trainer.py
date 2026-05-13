@@ -832,6 +832,11 @@ class RayPPOTrainer:
             )
         if teacher_advantage_w_ramp_steps is not None and int(teacher_advantage_w_ramp_steps) <= 0:
             raise ValueError("algorithm.copd.teacher_advantage_w_ramp_steps must be null or a positive integer.")
+        if config.algorithm.adv_estimator == AdvantageEstimator.COPD or str(config.algorithm.adv_estimator) == AdvantageEstimator.COPD.value:
+            if float(OmegaConf.select(config, "algorithm.copd.step_advantage_w") or 0.0) != 0.0:
+                raise ValueError("Episode-level COPD OPD requires algorithm.copd.step_advantage_w=0.0.")
+            if str(OmegaConf.select(config, "algorithm.copd.selector")) != "llm":
+                raise ValueError("Episode-level COPD OPD requires algorithm.copd.selector=llm.")
         if teacher_advantage_w_start is not None and phase_switch_after_steps is not None:
             teacher_start_after_steps = int(opd_start_after_steps or 0)
             teacher_enabled_steps_before_phase_switch = int(phase_switch_after_steps) - teacher_start_after_steps
@@ -1146,9 +1151,7 @@ class RayPPOTrainer:
                         for step in task.get("steps", [])
                     ],
                     "episode_summary": str(analysis.get("episode_summary", "")),
-                    "episode_hint": str(
-                        analysis.get("episode_hint") or analysis.get("overall_hint", "")
-                    ),
+                    "episode_hint": str(analysis.get("episode_hint", "")),
                     "step_hints": {
                         str(step_idx): str(hint)
                         for step_idx, hint in analysis.get("step_hints", {}).items()
@@ -1856,17 +1859,15 @@ class RayPPOTrainer:
     def _lazy_init_copd_analyzer(self):
         if self._copd_analyzer is None:
             module_logger.info(
-                "Initializing COPD analyzer with backend=%s, max_history_steps=%s, max_completion_tokens=%s, max_selected_steps_per_traj=%s",
+                "Initializing COPD analyzer with backend=%s, max_history_steps=%s, max_completion_tokens=%s",
                 self.config.algorithm.copd.analysis_backend,
                 self.config.algorithm.copd.analysis_max_history_steps,
                 self.config.algorithm.copd.analysis_max_completion_tokens,
-                self.config.algorithm.copd.stats_topk_per_traj,
             )
             self._copd_analyzer = core_copd.COPDEpisodeAnalyzer(
                 backend=self.config.algorithm.copd.analysis_backend,
                 max_history_steps=self.config.algorithm.copd.analysis_max_history_steps,
                 max_completion_tokens=self.config.algorithm.copd.analysis_max_completion_tokens,
-                max_selected_steps_per_traj=self.config.algorithm.copd.stats_topk_per_traj,
             )
         return self._copd_analyzer
 
@@ -1879,10 +1880,9 @@ class RayPPOTrainer:
             return None
 
         module_logger.info(
-            "Initializing COPD guide memory with top_k=%s, similarity_threshold=%s, embedding_model_path=%s, embedding_batch_size=%s, embedding_device=%s",
+            "Initializing COPD guide memory with top_k=%s, embedding_model_path=%s, embedding_batch_size=%s, embedding_device=%s",
             guide_config.get("top_k", 2),
-            guide_config.get("similarity_threshold", 0.3),
-            guide_config.get("embedding_model_path", "/raid3/data/GTPO/MODELS/Qwen3-Embedding-0.6B"),
+            guide_config.get("embedding_model_path"),
             guide_config.get("embedding_batch_size", 64),
             guide_config.get("embedding_device", None),
         )
@@ -1891,24 +1891,6 @@ class RayPPOTrainer:
             default_dump_dir=self.config.trainer.default_local_dir,
         )
         return self._copd_guide_memory
-
-    def _empty_copd_analysis_result(self, analysis_mode: str) -> Dict[str, object]:
-        return {
-            "episode_summary": "",
-            "episode_hint": "",
-            "step_hints": {},
-            "analysis_mode": analysis_mode,
-        }
-
-    @staticmethod
-    def _selected_steps_from_copd_analysis(analysis: Dict[object, object]) -> List[int]:
-        step_hints = analysis.get("step_hints", {}) or {}
-        if step_hints:
-            return [int(step_idx) for step_idx in step_hints.keys()]
-
-        # Backward-compatible fallback for old analysis dumps or in-flight jobs
-        # produced before step_hints carried the selected-step set.
-        return [int(step_idx) for step_idx in analysis.get("selected_steps", [])]
 
     def _get_copd_failure_success_threshold(self) -> float:
         threshold = OmegaConf.select(self.config, "algorithm.copd.failure_success_threshold")
@@ -1945,7 +1927,18 @@ class RayPPOTrainer:
             metrics["copd/guide_memory/enabled"] = 0.0
             return
 
-        episode_success = batch.non_tensor_batch.get("episode_success")
+        if "episode_success" in batch.non_tensor_batch:
+            episode_success = np.asarray(batch.non_tensor_batch["episode_success"], dtype=np.float32)
+        elif "episode_rewards" in batch.non_tensor_batch:
+            episode_success = (
+                np.asarray(batch.non_tensor_batch["episode_rewards"], dtype=np.float32)
+                >= self._get_copd_failure_success_threshold()
+            ).astype(np.float32)
+        else:
+            raise KeyError(
+                "COPD guide memory requires batch.non_tensor_batch['episode_success'] "
+                "or batch.non_tensor_batch['episode_rewards'] to assign skill_type."
+            )
         guide_metrics = guide_memory.update_from_episode_analysis(
             obs_texts=batch.non_tensor_batch.get("obs_text_base", batch.non_tensor_batch["obs_text"]),
             anchor_obs=batch.non_tensor_batch.get("anchor_obs"),
@@ -1995,13 +1988,7 @@ class RayPPOTrainer:
             }
             for future in as_completed(future_to_traj):
                 traj_uid = future_to_traj[future]
-                try:
-                    results[traj_uid] = future.result()
-                except Exception as exc:
-                    module_logger.warning("COPD analysis failed for trajectory %s: %s", traj_uid, exc)
-                    results[traj_uid] = self._empty_copd_analysis_result(
-                        analysis_mode=str(analysis_tasks[traj_uid].get("analysis_mode", "teacher_bootstrap"))
-                    )
+                results[traj_uid] = future.result()
         return results, max_workers
 
     def _prepare_copd_teacher_signals(
@@ -2047,7 +2034,6 @@ class RayPPOTrainer:
         configured_failed_only = bool(OmegaConf.select(self.config, "algorithm.copd.failed_only"))
         failed_only_after_steps = self._get_copd_failed_only_after_steps()
         failed_only = self._should_copd_analyze_failed_only()
-        enhance_step_hint_only = bool(OmegaConf.select(self.config, "algorithm.copd.enhance_step_hint_only"))
         analysis_mode = "failed_episode_opd" if failed_only else "teacher_bootstrap"
 
         module_logger.info(
@@ -2085,15 +2071,8 @@ class RayPPOTrainer:
             float(failed_only_after_steps) if failed_only_after_steps is not None else -1.0
         )
         metrics["copd/failed_only_schedule_active"] = 1.0 if failed_only_after_steps is not None else 0.0
-        metrics["copd/enhance_step_hint_only"] = 1.0 if enhance_step_hint_only else 0.0
         metrics["copd/failure_success_threshold"] = self._get_copd_failure_success_threshold()
         critical_mask_np = np.zeros(batch_size, dtype=bool)
-        selector_stats = {
-            "num_groups": 0.0,
-            "eligible_groups": 0.0,
-            "selected_steps": 0.0,
-            "variance_cutoff": 0.0,
-        }
         base_obs_texts = batch.non_tensor_batch.get("obs_text_base", batch.non_tensor_batch["obs_text"])
         analysis_obs_texts = base_obs_texts
 
@@ -2139,82 +2118,35 @@ class RayPPOTrainer:
         metrics["copd/analyzed_traj_count"] = analyzed_traj_count
         metrics["copd/failed_traj_count"] = analyzed_traj_count
         metrics["copd/skipped_success_traj_count"] = float(max(len(episodes) - int(analyzed_traj_count), 0))
-        if selector == "stats":
-            candidate_mask_np, selector_stats = core_copd.select_critical_steps_by_stats(
-                step_rewards=batch.batch["step_rewards"],
-                anchor_obs=batch.non_tensor_batch["anchor_obs"],
-                index=batch.non_tensor_batch["uid"],
-                traj_index=batch.non_tensor_batch["traj_uid"],
-                enable_similarity=self.config.algorithm.copd.enable_similarity,
-                similarity_thresh=self.config.algorithm.copd.similarity_thresh,
-                min_group_size=self.config.algorithm.copd.stats_min_group_size,
-                var_quantile=self.config.algorithm.copd.stats_var_quantile,
-                topk_per_traj=self.config.algorithm.copd.stats_topk_per_traj,
-                below_group_mean_only=self.config.algorithm.copd.stats_below_group_mean_only,
-            )
-            module_logger.info(
-                "COPD stats selector produced %s candidate critical steps (groups=%s, eligible_groups=%s, variance_cutoff=%.6f)",
-                int(candidate_mask_np.sum()),
-                int(selector_stats["num_groups"]),
-                int(selector_stats["eligible_groups"]),
-                float(selector_stats["variance_cutoff"]),
-            )
-            for traj_uid, steps in episodes.items():
-                if not _should_analyze_traj(traj_uid):
-                    continue
-                candidate_step_indices = [
-                    int(step_indices[sample_idx])
-                    for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"])
-                    if sample_traj_uid == traj_uid and candidate_mask_np[sample_idx]
-                ]
-                if not candidate_step_indices:
-                    episode_analysis[traj_uid] = {
-                        "episode_summary": "",
-                        "episode_hint": "",
-                        "step_hints": {},
-                        "analysis_mode": analysis_mode,
-                    }
-                    continue
-                analysis_tasks[traj_uid] = {
-                    "steps": steps,
-                    "candidate_step_indices": candidate_step_indices or None,
-                    "analysis_mode": analysis_mode,
-                    "episode_success": traj_success.get(traj_uid),
-                }
-            analyzed, analysis_workers = self._analyze_copd_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
-            episode_analysis.update(analyzed)
-        elif selector == "llm":
-            module_logger.info(
-                "COPD LLM selector will analyze %s/%s trajectories for critical-step selection.",
-                int(analyzed_traj_count),
-                len(episodes),
-            )
-            for traj_uid, steps in episodes.items():
-                if not _should_analyze_traj(traj_uid):
-                    continue
-                analysis_tasks[traj_uid] = {
-                    "steps": steps,
-                    "candidate_step_indices": [int(step["step_index"]) for step in steps],
-                    "analysis_mode": analysis_mode,
-                    "episode_success": traj_success.get(traj_uid),
-                }
-            analyzed, analysis_workers = self._analyze_copd_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
-            episode_analysis.update(analyzed)
-        else:
-            raise ValueError(f"Unsupported COPD selector: {selector}")
+        if selector != "llm":
+            raise ValueError("Episode-level COPD OPD requires algorithm.copd.selector=llm.")
+
+        module_logger.info(
+            "COPD LLM analyzer will build episode-level teacher guidance for %s/%s trajectories.",
+            int(analyzed_traj_count),
+            len(episodes),
+        )
+        for traj_uid, steps in episodes.items():
+            if not _should_analyze_traj(traj_uid):
+                continue
+            analysis_tasks[traj_uid] = {
+                "steps": steps,
+                "candidate_step_indices": [int(step["step_index"]) for step in steps],
+                "analysis_mode": analysis_mode,
+                "episode_success": traj_success.get(traj_uid),
+            }
+        analyzed, analysis_workers = self._analyze_copd_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
+        episode_analysis.update(analyzed)
 
         critical_mask_np = np.zeros(batch_size, dtype=bool)
-        for traj_uid, analysis in episode_analysis.items():
-            selected_steps = set(self._selected_steps_from_copd_analysis(analysis))
-            if not selected_steps:
-                continue
-            for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
-                if sample_traj_uid == traj_uid and int(step_indices[sample_idx]) in selected_steps:
-                    critical_mask_np[sample_idx] = True
-        selector_stats["selected_steps"] = float(critical_mask_np.sum())
+        analyzed_traj_uids = set(episode_analysis.keys())
+        for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
+            if sample_traj_uid in analyzed_traj_uids:
+                critical_mask_np[sample_idx] = True
         module_logger.info(
-            "COPD analysis chose %s selected steps after post-processing.",
+            "COPD episode-level OPD selected %s steps from %s analyzed trajectories.",
             int(critical_mask_np.sum()),
+            len(analyzed_traj_uids),
         )
         metrics["copd/analysis_num_requests"] = float(len(analysis_tasks))
         metrics["copd/analysis_num_workers"] = float(analysis_workers)
@@ -2241,11 +2173,8 @@ class RayPPOTrainer:
         metrics["copd/critical_step_ratio"] = float(critical_mask_np.mean()) if batch_size > 0 else 0.0
         metrics["copd/teacher_batch_size"] = float(len(critical_indices))
         metrics["copd/teacher_available"] = 1.0
-        metrics["copd/selector_num_groups"] = selector_stats["num_groups"]
-        metrics["copd/selector_eligible_groups"] = selector_stats["eligible_groups"]
-        metrics["copd/selector_variance_cutoff"] = selector_stats["variance_cutoff"]
         module_logger.info(
-            "COPD finalized %s selected steps (critical_step_ratio=%.4f, analysis_mode=%s).",
+            "COPD finalized %s OPD-scored steps (step_ratio=%.4f, analysis_mode=%s).",
             len(critical_indices),
             metrics["copd/critical_step_ratio"],
             analysis_mode,
@@ -2280,7 +2209,7 @@ class RayPPOTrainer:
             return batch
 
         if len(critical_indices) == 0:
-            module_logger.info("COPD did not select any critical steps for the current batch.")
+            module_logger.info("COPD has no episode-level OPD steps for the current batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
             self._update_copd_guide_memory(
                 batch=batch,
@@ -2314,7 +2243,7 @@ class RayPPOTrainer:
         critical_preview = []
         guide_memory = self._lazy_init_copd_guide_memory()
         teacher_use_guide_memory = bool(
-            teacher_enabled and guide_memory is not None and not enhance_step_hint_only
+            teacher_enabled and guide_memory is not None and int(guide_memory.top_k) > 0
         )
         skill_guided_steps = 0
         skills_retrieved = 0
@@ -2341,15 +2270,10 @@ class RayPPOTrainer:
 
         for critical_pos, sample_idx in enumerate(critical_indices):
             traj_uid = batch.non_tensor_batch["traj_uid"][sample_idx]
-            analysis = episode_analysis.get(traj_uid, {})
-            step_hint = analysis.get("step_hints", {}).get(int(step_indices[sample_idx]), "")
+            analysis = episode_analysis[traj_uid]
             observation_text = str(base_obs_texts[sample_idx])
             episode_summary = str(analysis.get("episode_summary", ""))
-            episode_hint = str(
-                analysis.get("episode_hint")
-                or analysis.get("overall_hint")
-                or episode_summary
-            )
+            episode_hint = str(analysis["episode_hint"])
             retrieved_skills = []
             retrieved_skill_records = []
             if teacher_use_guide_memory and critical_pos < len(retrieval_results_by_critical_pos):
@@ -2361,7 +2285,7 @@ class RayPPOTrainer:
             enhanced_obs = build_augmented_observation_text(
                 observation=observation_text,
                 skills=retrieved_skills,
-                step_hint=str(step_hint),
+                episode_hint=episode_hint,
             )
             enhanced_obs_texts.append(enhanced_obs)
             augmented_observation_dump_entries.append(
@@ -2372,12 +2296,10 @@ class RayPPOTrainer:
                     "step_idx": int(step_indices[sample_idx]),
                     "analysis_mode": analysis.get("analysis_mode"),
                     "teacher_use_guide_memory": bool(teacher_use_guide_memory),
-                    "enhance_step_hint_only": bool(enhance_step_hint_only),
                     "observation": observation_text,
                     "augmented_observation": enhanced_obs,
                     "episode_summary": episode_summary,
                     "episode_hint": episode_hint,
-                    "hindsight_hint": str(step_hint),
                     "retrieved_skills": [str(skill) for skill in retrieved_skills],
                     "retrieved_skill_records": retrieved_skill_records,
                 }
@@ -2392,7 +2314,7 @@ class RayPPOTrainer:
                     {
                         "traj_uid": str(traj_uid),
                         "step_idx": int(step_indices[sample_idx]),
-                        "hint_preview": str(step_hint).replace("\n", " ")[:160],
+                        "hint_preview": episode_hint.replace("\n", " ")[:160],
                         "obs_preview": str(batch.non_tensor_batch["obs_text"][sample_idx]).replace("\n", " ")[:160],
                     }
                 )
@@ -2402,14 +2324,14 @@ class RayPPOTrainer:
         metrics["copd/guide_memory/skills_retrieved"] = float(skills_retrieved)
 
         module_logger.info(
-            "COPD built %s enhanced observations for teacher scoring across %s trajectories.",
+            "COPD built %s episode-level enhanced observations for teacher scoring across %s trajectories.",
             len(enhanced_obs_texts),
             len({batch.non_tensor_batch['traj_uid'][sample_idx] for sample_idx in critical_indices}),
         )
         if self._lazy_init_copd_guide_memory() is not None:
             metrics.update(self._lazy_init_copd_guide_memory().snapshot_metrics(prefix="copd/guide_memory"))
         if critical_preview and module_logger.isEnabledFor(logging.DEBUG):
-            module_logger.debug("COPD critical-step preview: %s", critical_preview)
+            module_logger.debug("COPD episode-level OPD preview: %s", critical_preview)
         self._dump_copd_augmented_observations(augmented_observation_dump_entries)
 
         teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
@@ -2452,7 +2374,7 @@ class RayPPOTrainer:
         teacher_lp = teacher_log_prob.batch["old_log_probs"]
 
         module_logger.info(
-            "COPD computed teacher log-probs for %s critical steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
+            "COPD computed teacher log-probs for %s OPD-scored steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
             len(critical_indices),
             float(teacher_lp.mean().detach().cpu().item()),
             float(teacher_lp.min().detach().cpu().item()),

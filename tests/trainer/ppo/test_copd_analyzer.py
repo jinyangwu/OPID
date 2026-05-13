@@ -28,7 +28,7 @@ def _sample_steps():
     ]
 
 
-def test_copd_openai_prompt_uses_step_hints_as_selected_steps():
+def test_copd_openai_prompt_uses_episode_hint_only():
     analyzer = COPDEpisodeAnalyzer()
 
     prompt = analyzer._build_episode_analysis_prompt(
@@ -42,10 +42,14 @@ def test_copd_openai_prompt_uses_step_hints_as_selected_steps():
     assert "overall_hint" not in user_prompt
     assert "episode_summary" not in user_prompt
     assert "episode_hint" in user_prompt
+    assert "step_hints" not in user_prompt
     assert "Return format:" in user_prompt
     assert "Task description:" in user_prompt
     assert "find a red mug under 20 dollars" in user_prompt
     assert "successful workflow" in user_prompt
+    assert "under 45 words" in user_prompt
+    assert "do not mention specific product names, colors, sizes, prices, brands" in user_prompt
+    assert "Do not list many warning signs or examples" in user_prompt
     assert "episode_success: success" in user_prompt
     assert "interpreted_outcome" not in user_prompt
     assert "Because this is a successful episode" not in user_prompt
@@ -63,12 +67,13 @@ def test_copd_prompt_for_failed_episode_emphasizes_avoidance():
 
     assert "why the trajectory failed" in user_prompt
     assert "avoid that failure pattern" in user_prompt
+    assert "core mistake and the safer general workflow" in user_prompt
     assert "episode_success: failure" in user_prompt
     assert "interpreted_outcome" not in user_prompt
     assert "Because this is a failed episode" not in user_prompt
 
 
-def test_copd_parse_omits_legacy_selected_steps_field():
+def test_copd_parse_uses_episode_hint_only():
     analyzer = COPDEpisodeAnalyzer()
 
     parsed = analyzer._parse_analysis_response(
@@ -86,4 +91,4 @@ def test_copd_parse_omits_legacy_selected_steps_field():
 
     assert "selected_steps" not in parsed
     assert parsed["episode_hint"] == "hint"
-    assert parsed["step_hints"] == {1: "click the matching item"}
+    assert parsed["step_hints"] == {}

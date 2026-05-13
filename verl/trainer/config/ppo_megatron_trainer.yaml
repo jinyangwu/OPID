@@ -295,7 +295,7 @@ algorithm:
     enable_similarity: False
     similarity_thresh: 0.95
   copd:
-    step_advantage_w: 1.0
+    step_advantage_w: 0.0
     teacher_advantage_w: 1.0
     opd_start_after_steps: null
     teacher_advantage_w_start: null
@@ -306,16 +306,11 @@ algorithm:
     enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
     similarity_thresh: 0.95
-    selector: "stats"
+    selector: "llm"
     failed_only: False # if True, analyze and apply teacher OPD only on failed episodes
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
-    enhance_step_hint_only: False # if True, teacher prompts add only the selected step hint, without episode summary or guide memory
-    stats_min_group_size: 2
-    stats_var_quantile: 0.75
-    stats_topk_per_traj: 1
-    stats_below_group_mean_only: True
-    analysis_backend: "heuristic"
+    analysis_backend: "openai"
     analysis_num_workers: 8
     analysis_max_history_steps: 6
     analysis_max_completion_tokens: 1024

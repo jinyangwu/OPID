@@ -321,7 +321,7 @@ def summarize_copd_advantage_components(
     episode_advantages: torch.Tensor,
     step_advantages: torch.Tensor,
     teacher_advantages: torch.Tensor,
-    step_advantage_w: float = 1.0,
+    step_advantage_w: float = 0.0,
     teacher_advantage_w: float = 1.0,
     epsilon: float = 1e-6,
 ) -> Dict[str, float]:
@@ -409,7 +409,7 @@ def compute_copd_advantage_components(
     old_log_prob: Optional[torch.Tensor] = None,
     critical_step_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
     epsilon: float = 1e-6,
-    step_advantage_w: float = 1.0,
+    step_advantage_w: float = 0.0,
     teacher_advantage_w: float = 1.0,
     mode: str = "mean_norm",
     enable_similarity: bool = False,
@@ -419,8 +419,12 @@ def compute_copd_advantage_components(
     metrics_prefix: str = "copd/state_group",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     """
-    Compute the three token-level COPD advantage components and the weighted sum.
+    Compute episode-level COPD advantages plus an optional episode-level teacher term.
     """
+    if float(step_advantage_w) != 0.0:
+        raise ValueError("COPD now uses episode-level advantage only; set algorithm.copd.step_advantage_w=0.0.")
+    del step_rewards, anchor_obs, enable_similarity, similarity_thresh, metrics_prefix
+
     remove_std = _mode_to_remove_std(mode)
 
     episode_advantages = episode_norm_reward(
@@ -432,31 +436,8 @@ def compute_copd_advantage_components(
         remove_std=remove_std,
     )
 
-    step_group_uids = build_step_group(
-        anchor_obs=anchor_obs,
-        index=index,
-        enable_similarity=enable_similarity,
-        similarity_thresh=similarity_thresh,
-    )
-    step_group_metrics = compute_step_group_distribution_metrics(
-        step_group_uids=step_group_uids,
-        prefix=metrics_prefix,
-    )
-    step_group_counts = Counter(
-        step_group_uids.tolist()
-        if isinstance(step_group_uids, np.ndarray)
-        else list(step_group_uids)
-    )
-    step_group_metrics[f"{metrics_prefix}/raw_group_sizes"] = [
-        int(size) for size in step_group_counts.values()
-    ]
-    step_advantages = step_norm_reward(
-        step_rewards=step_rewards,
-        response_mask=response_mask,
-        index=step_group_uids,
-        epsilon=epsilon,
-        remove_std=remove_std,
-    )
+    step_advantages = torch.zeros_like(episode_advantages)
+    step_group_metrics: Dict[str, float] = {}
 
     teacher_advantages = compute_teacher_token_advantage(
         response_mask=response_mask,
@@ -470,7 +451,6 @@ def compute_copd_advantage_components(
 
     scores = (
         episode_advantages
-        + step_advantage_w * step_advantages
         + teacher_advantage_w * teacher_advantages
     )
     return episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics
@@ -527,7 +507,7 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
                                    old_log_prob: Optional[torch.Tensor] = None,
                                    critical_step_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
                                    epsilon: float = 1e-6,
-                                   step_advantage_w: float = 1.0,
+                                   step_advantage_w: float = 0.0,
                                    teacher_advantage_w: float = 1.0,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
@@ -539,10 +519,8 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
     """
     Compute the advantages for COPD.
 
-    COPD extends GiGPO by adding a token-level teacher advantage term:
-        episode_adv + w_step * step_adv + w_teacher * teacher_adv
-    where ``teacher_adv`` is derived from
-        ``teacher_log_prob - old_log_prob``.
+    COPD uses only episode-level outcome advantages plus an episode-level
+    teacher term derived from ``teacher_log_prob - old_log_prob``.
     """
     episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics = compute_copd_advantage_components(
         token_level_rewards=token_level_rewards,
