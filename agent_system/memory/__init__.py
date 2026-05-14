@@ -15,7 +15,6 @@
 
 from .memory import SimpleMemory, SearchMemory
 from .skills_only_memory import SkillsOnlyMemory
-from .guide_memory import COPDGuideMemory
 
 
 def __getattr__(name):
@@ -34,7 +33,6 @@ __all__ = [
     "SimpleMemory",
     "SearchMemory",
     "SkillsOnlyMemory",
-    "COPDGuideMemory",
     "RetrievalMemory",
     "SkillUpdater",
 ]

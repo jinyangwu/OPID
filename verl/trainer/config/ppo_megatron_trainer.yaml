@@ -301,7 +301,6 @@ algorithm:
     teacher_advantage_w_start: null
     teacher_advantage_w_ramp_steps: null
     phase_switch_after_steps: null
-    use_with_memory_after_phase_switch: False
     mode: "mean_norm"
     enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
@@ -314,6 +313,7 @@ algorithm:
     analysis_num_workers: 8
     analysis_max_history_steps: 6
     analysis_max_completion_tokens: 1024
+    analysis_max_step_hints_per_traj: 1
     save_analysis: False
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/copd_analysis
     save_augmented_observations: True

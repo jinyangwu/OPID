@@ -262,7 +262,6 @@ algorithm:
     teacher_advantage_w_start: null # null -> keep teacher_advantage_w constant; otherwise linearly ramp from start to teacher_advantage_w
     teacher_advantage_w_ramp_steps: null # null -> use remaining trainer.total_training_steps after opd_start_after_steps for the ramp length
     phase_switch_after_steps: null
-    use_with_memory_after_phase_switch: False
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
@@ -275,6 +274,7 @@ algorithm:
     analysis_num_workers: 8
     analysis_max_history_steps: 15
     analysis_max_completion_tokens: 1024
+    analysis_max_step_hints_per_traj: 1 # number of critical step_hints to add alongside the episode_hint
     save_analysis: True
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/copd_analysis
     save_augmented_observations: True
@@ -325,22 +325,6 @@ env:
   seed: 0
   max_steps: 50
   history_length: 2
-  guide_memory:
-    enable: False
-    top_k: 2
-    max_per_skill_type: 1
-    dedupe_skill_similarity_thresh: 0.88
-    enable_batch_task_aggregation: True
-    embedding_model_path: ${oc.env:MODELS_ROOT}/Qwen3-Embedding-0.6B
-    embedding_batch_size: 64
-    embedding_device: null # null -> sentence-transformers auto device
-    promote_min_support: 2
-    merge_task_similarity_thresh: 0.85
-    max_skills: 128
-    max_embedding_cache_entries: 4096
-    batch_cluster_similarity_thresh: 0.85
-    dump_dir: null # null -> ${trainer.default_local_dir}/guide_memory
-    dump_freq_steps: 1
   resources_per_worker: # resources for each env worker
     num_cpus: 0.1
     num_gpus: 0

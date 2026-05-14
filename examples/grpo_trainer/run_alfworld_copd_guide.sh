@@ -26,30 +26,16 @@ COPD_FAILED_ONLY=${COPD_FAILED_ONLY:-False}
 COPD_FAILED_ONLY_AFTER_STEPS=${COPD_FAILED_ONLY_AFTER_STEPS:-null}
 COPD_FAILURE_SUCCESS_THRESHOLD=${COPD_FAILURE_SUCCESS_THRESHOLD:-1.0}
 
-# COPD episode-level analysis.
+# COPD episode + critical-step hint analysis.
 COPD_ENABLE_ANALYSIS=${COPD_ENABLE_ANALYSIS:-True}
 COPD_SELECTOR=${COPD_SELECTOR:-llm}
 COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
-
-# Guide memory retrieval and storage behavior.
-GUIDE_MEMORY_ENABLE=${GUIDE_MEMORY_ENABLE:-True}
-GUIDE_TOP_K=${GUIDE_TOP_K:-0}
-GUIDE_MAX_PER_SKILL_TYPE=${GUIDE_MAX_PER_SKILL_TYPE:-1}
-GUIDE_DEDUPE_SKILL_SIMILARITY_THRESH=${GUIDE_DEDUPE_SKILL_SIMILARITY_THRESH:-0.88}
-GUIDE_ENABLE_BATCH_TASK_AGGREGATION=${GUIDE_ENABLE_BATCH_TASK_AGGREGATION:-True}
-GUIDE_EMBEDDING_MODEL_PATH=${GUIDE_EMBEDDING_MODEL_PATH:-$MODELS_ROOT/Qwen3-Embedding-0.6B}
-GUIDE_EMBEDDING_BATCH_SIZE=${GUIDE_EMBEDDING_BATCH_SIZE:-64}
-GUIDE_EMBEDDING_DEVICE=${GUIDE_EMBEDDING_DEVICE:-null}
-GUIDE_PROMOTE_MIN_SUPPORT=${GUIDE_PROMOTE_MIN_SUPPORT:-1}
-GUIDE_MERGE_TASK_SIMILARITY_THRESH=${GUIDE_MERGE_TASK_SIMILARITY_THRESH:-0.85}
-GUIDE_MAX_SKILLS=${GUIDE_MAX_SKILLS:-128}
-GUIDE_MAX_EMBEDDING_CACHE_ENTRIES=${GUIDE_MAX_EMBEDDING_CACHE_ENTRIES:-4096}
-GUIDE_BATCH_CLUSTER_SIMILARITY_THRESH=${GUIDE_BATCH_CLUSTER_SIMILARITY_THRESH:-0.85}
+COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ=${COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ:-5}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_alfworld
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_alfworld_llm_episode-hint_opd-adv-0.001_exp1}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_1.5b_alfworld_llm-5_episode-step-hint_opd-adv-0.001_exp2}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -102,7 +88,6 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
     algorithm.copd.opd_start_after_steps=$COPD_OPD_START_AFTER_STEPS \
     algorithm.copd.phase_switch_after_steps=$COPD_PHASE_SWITCH_AFTER_STEPS \
-    algorithm.copd.use_with_memory_after_phase_switch=False \
     algorithm.copd.failed_only=$COPD_FAILED_ONLY \
     algorithm.copd.failed_only_after_steps=$COPD_FAILED_ONLY_AFTER_STEPS \
     algorithm.copd.failure_success_threshold=$COPD_FAILURE_SUCCESS_THRESHOLD \
@@ -113,20 +98,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.analysis_num_workers=$COPD_ANALYSIS_NUM_WORKERS \
     algorithm.copd.analysis_max_history_steps=15 \
     algorithm.copd.analysis_max_completion_tokens=4096 \
+    algorithm.copd.analysis_max_step_hints_per_traj=$COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ \
     algorithm.copd.normalize_teacher_adv=False \
-    env.guide_memory.enable=$GUIDE_MEMORY_ENABLE \
-    env.guide_memory.top_k=$GUIDE_TOP_K \
-    env.guide_memory.max_per_skill_type=$GUIDE_MAX_PER_SKILL_TYPE \
-    env.guide_memory.dedupe_skill_similarity_thresh=$GUIDE_DEDUPE_SKILL_SIMILARITY_THRESH \
-    env.guide_memory.enable_batch_task_aggregation=$GUIDE_ENABLE_BATCH_TASK_AGGREGATION \
-    env.guide_memory.embedding_model_path=$GUIDE_EMBEDDING_MODEL_PATH \
-    env.guide_memory.embedding_batch_size=$GUIDE_EMBEDDING_BATCH_SIZE \
-    env.guide_memory.embedding_device=$GUIDE_EMBEDDING_DEVICE \
-    env.guide_memory.promote_min_support=$GUIDE_PROMOTE_MIN_SUPPORT \
-    env.guide_memory.merge_task_similarity_thresh=$GUIDE_MERGE_TASK_SIMILARITY_THRESH \
-    env.guide_memory.max_skills=$GUIDE_MAX_SKILLS \
-    env.guide_memory.max_embedding_cache_entries=$GUIDE_MAX_EMBEDDING_CACHE_ENTRIES \
-    env.guide_memory.batch_cluster_similarity_thresh=$GUIDE_BATCH_CLUSTER_SIMILARITY_THRESH \
     env.history_length=$history_length \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \

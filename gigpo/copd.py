@@ -216,7 +216,7 @@ def build_episode_records(
 
 class COPDEpisodeAnalyzer:
     """
-    Analyze trajectories for reusable episode-level teacher guidance.
+    Analyze trajectories for reusable episode-level and critical-step guidance.
 
     The analyzer uses an OpenAI-compatible JSON analysis backend.
     ``azure`` remains a legacy alias for ``openai``.
@@ -227,6 +227,7 @@ class COPDEpisodeAnalyzer:
         backend: str = "openai",
         max_history_steps: int = 6,
         max_completion_tokens: int = 4096,
+        max_step_hints_per_traj: int = 1,
     ):
         self.requested_backend = backend
         if backend == "azure":
@@ -238,16 +239,18 @@ class COPDEpisodeAnalyzer:
         self.backend = backend
         self.max_history_steps = max_history_steps
         self.max_completion_tokens = max_completion_tokens
+        self.max_step_hints_per_traj = max(int(max_step_hints_per_traj), 0)
         self.client = None
         self.model = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
 
         logger.info(
-            "Initialized COPDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_history_steps=%s, max_completion_tokens=%s",
+            "Initialized COPDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_history_steps=%s, max_completion_tokens=%s, max_step_hints_per_traj=%s",
             self.requested_backend,
             self.backend,
             self.model,
             self.max_history_steps,
             self.max_completion_tokens,
+            self.max_step_hints_per_traj,
         )
 
     def _get_openai_client(self):
@@ -303,7 +306,15 @@ class COPDEpisodeAnalyzer:
             max_completion_tokens=self.max_completion_tokens,
         )
         parsed = self._parse_analysis_response(content)
-        parsed["step_hints"] = {}
+        candidate_step_set = set(candidate_list)
+        filtered_step_hints = {
+            step_idx: hint
+            for step_idx, hint in parsed.get("step_hints", {}).items()
+            if step_idx in candidate_step_set
+        }
+        parsed["step_hints"] = dict(
+            list(filtered_step_hints.items())[: self.max_step_hints_per_traj]
+        )
         parsed["analysis_backend_requested"] = self.requested_backend
         parsed["analysis_backend_used"] = "openai"
         parsed["analysis_error"] = None
@@ -334,8 +345,8 @@ class COPDEpisodeAnalyzer:
         episode_success: Optional[float] = None,
         task_description: Optional[str] = None,
     ) -> Dict[str, Any]:
-        del candidate_step_indices
         task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
+        max_hint_count = min(self.max_step_hints_per_traj, len(candidate_step_indices))
 
         outcome_label = "unknown"
         if episode_success is not None:
@@ -366,23 +377,33 @@ class COPDEpisodeAnalyzer:
 
 {episode_hint_instruction}
 
+Also write step_hints for at most {max_hint_count} critical step(s) from the candidate set. A step_hint is local guidance for only that step; choose the step(s) where extra current-step advice would most improve or secure the trajectory.
+
 Important constraints:
 - Step indexing is 0-based: step 0 is the first step of the trajectory.
 - Use the full episode context.
 - Write episode_hint as sequence-level policy-facing guidance, not as a current-step instruction.
-- The episode_hint is the only teacher guidance used for every OPD-scored step in this episode.
+- The episode_hint is used for every OPD-scored step in this episode.
+- step_hints are used only on their keyed critical steps.
+- step_hints keys must come from Candidate step indices.
+- Each step_hints value should be one short imperative sentence grounded in information available at or before that step.
 - Keep episode_hint concise: 1-2 sentences, ideally under 45 words.
 - Generalize away instance details: do not mention specific product names, colors, sizes, prices, brands, or quoted search terms from the task.
 - Do not list many warning signs or examples; include only the single reusable rule that should guide future behavior.
 
 Return format:
 {{
-  "episode_hint": "string"
+  "episode_hint": "string",
+  "step_hints": {{
+    "0": "hint for step 0",
+    "2": "hint for step 2"
+  }}
 }}
 
 Episode context:
 - Task description: {task_description or "(not available)"}
 - episode_success: {outcome_label}
+- Candidate step indices: {list(candidate_step_indices)}
 - Interaction trajectory: {self._format_episode_steps(steps)}
 """
         return build_prompt_dict(user_prompt=prompt_text)
@@ -395,10 +416,18 @@ Episode context:
         parsed = json.loads(response[json_start:json_end])
         if "episode_hint" not in parsed:
             raise ValueError("COPD analyzer response missing required field: episode_hint")
+        step_hints_raw = parsed.get("step_hints", {}) or {}
+        step_hints = {}
+        if isinstance(step_hints_raw, dict):
+            for step_idx, hint in step_hints_raw.items():
+                try:
+                    step_hints[int(step_idx)] = str(hint)
+                except (TypeError, ValueError):
+                    continue
         return {
             "episode_summary": str(parsed.get("episode_summary", "")),
             "episode_hint": str(parsed["episode_hint"]),
-            "step_hints": {},
+            "step_hints": step_hints,
         }
 
     def _format_episode_steps(self, steps: List[Dict[str, object]]) -> str:

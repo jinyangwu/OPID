@@ -28,7 +28,7 @@ def _sample_steps():
     ]
 
 
-def test_copd_openai_prompt_uses_episode_hint_only():
+def test_copd_openai_prompt_requests_episode_hint_and_step_hints():
     analyzer = COPDEpisodeAnalyzer()
 
     prompt = analyzer._build_episode_analysis_prompt(
@@ -40,13 +40,14 @@ def test_copd_openai_prompt_uses_episode_hint_only():
 
     assert "selected_steps" not in user_prompt
     assert "overall_hint" not in user_prompt
-    assert "episode_summary" not in user_prompt
     assert "episode_hint" in user_prompt
-    assert "step_hints" not in user_prompt
+    assert "step_hints" in user_prompt
     assert "Return format:" in user_prompt
     assert "Task description:" in user_prompt
     assert "find a red mug under 20 dollars" in user_prompt
     assert "successful workflow" in user_prompt
+    assert "critical step" in user_prompt
+    assert "step_hints keys must come from Candidate step indices" in user_prompt
     assert "under 45 words" in user_prompt
     assert "do not mention specific product names, colors, sizes, prices, brands" in user_prompt
     assert "Do not list many warning signs or examples" in user_prompt
@@ -73,7 +74,7 @@ def test_copd_prompt_for_failed_episode_emphasizes_avoidance():
     assert "Because this is a failed episode" not in user_prompt
 
 
-def test_copd_parse_uses_episode_hint_only():
+def test_copd_parse_uses_episode_hint_and_step_hints():
     analyzer = COPDEpisodeAnalyzer()
 
     parsed = analyzer._parse_analysis_response(
@@ -91,4 +92,4 @@ def test_copd_parse_uses_episode_hint_only():
 
     assert "selected_steps" not in parsed
     assert parsed["episode_hint"] == "hint"
-    assert parsed["step_hints"] == {}
+    assert parsed["step_hints"] == {1: "click the matching item"}
