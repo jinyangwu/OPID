@@ -272,7 +272,6 @@ algorithm:
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
     analysis_num_workers: 8
-    analysis_max_history_steps: 15
     analysis_max_completion_tokens: 1024
     analysis_max_step_hints_per_traj: 1 # number of critical step_hints to add alongside the episode_hint
     save_analysis: True

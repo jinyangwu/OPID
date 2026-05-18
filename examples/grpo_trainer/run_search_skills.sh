@@ -14,7 +14,7 @@ TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=gigpo \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \
     data.train_batch_size=$train_data_size \
@@ -49,6 +49,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.01 \
     algorithm.use_kl_in_reward=False \
+    algorithm.gigpo.step_advantage_w=0.0 \
+    algorithm.gigpo.mode=mean_std_norm \
     env.env_name=search \
     env.seed=0 \
     env.max_steps=4 \

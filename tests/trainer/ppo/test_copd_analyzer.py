@@ -93,3 +93,56 @@ def test_copd_parse_uses_episode_hint_and_step_hints():
     assert "selected_steps" not in parsed
     assert parsed["episode_hint"] == "hint"
     assert parsed["step_hints"] == {1: "click the matching item"}
+
+
+def test_copd_parse_extracts_json_from_markdown_fence():
+    analyzer = COPDEpisodeAnalyzer()
+
+    parsed = analyzer._parse_analysis_response(
+        """
+        Here is the result:
+        ```json
+        {
+          "episode_hint": "check the constraints before choosing",
+          "step_hints": {"0": "verify the key constraint first"}
+        }
+        ```
+        """
+    )
+
+    assert parsed["episode_hint"] == "check the constraints before choosing"
+    assert parsed["step_hints"] == {0: "verify the key constraint first"}
+
+
+def test_copd_parse_prefers_object_with_episode_hint():
+    analyzer = COPDEpisodeAnalyzer()
+
+    parsed = analyzer._parse_analysis_response(
+        """
+        Ignore this helper object: {"note": "not the answer"}
+        Final answer:
+        {
+          "episode_hint": "use the final matching evidence",
+          "step_hints": {"1": "click only after matching the task"}
+        }
+        """
+    )
+
+    assert parsed["episode_hint"] == "use the final matching evidence"
+    assert parsed["step_hints"] == {1: "click only after matching the task"}
+
+
+def test_copd_parse_repairs_common_json_noise():
+    analyzer = COPDEpisodeAnalyzer()
+
+    parsed = analyzer._parse_analysis_response(
+        """
+        {
+          'episode_hint': 'compare all required attributes before acting',
+          'step_hints': {'1': 'check the attributes before selecting'},
+        }
+        """
+    )
+
+    assert parsed["episode_hint"] == "compare all required attributes before acting"
+    assert parsed["step_hints"] == {1: "check the attributes before selecting"}

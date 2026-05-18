@@ -1631,15 +1631,13 @@ class RayPPOTrainer:
             if max_step_hints_per_traj is None:
                 max_step_hints_per_traj = 1
             module_logger.info(
-                "Initializing COPD analyzer with backend=%s, max_history_steps=%s, max_completion_tokens=%s, max_step_hints_per_traj=%s",
+                "Initializing COPD analyzer with backend=%s, max_completion_tokens=%s, max_step_hints_per_traj=%s",
                 self.config.algorithm.copd.analysis_backend,
-                self.config.algorithm.copd.analysis_max_history_steps,
                 self.config.algorithm.copd.analysis_max_completion_tokens,
                 max_step_hints_per_traj,
             )
             self._copd_analyzer = core_copd.COPDEpisodeAnalyzer(
                 backend=self.config.algorithm.copd.analysis_backend,
-                max_history_steps=self.config.algorithm.copd.analysis_max_history_steps,
                 max_completion_tokens=self.config.algorithm.copd.analysis_max_completion_tokens,
                 max_step_hints_per_traj=max_step_hints_per_traj,
             )
@@ -1702,7 +1700,27 @@ class RayPPOTrainer:
             }
             for future in as_completed(future_to_traj):
                 traj_uid = future_to_traj[future]
-                results[traj_uid] = future.result()
+                try:
+                    results[traj_uid] = future.result()
+                except Exception as exc:
+                    task = analysis_tasks.get(traj_uid, {})
+                    module_logger.warning(
+                        "COPD episode analysis failed for traj_uid=%s; skipping teacher signal for this trajectory: %s",
+                        traj_uid,
+                        exc,
+                    )
+                    results[traj_uid] = {
+                        "episode_summary": "",
+                        "episode_hint": "",
+                        "step_hints": {},
+                        "analysis_backend_requested": backend,
+                        "analysis_backend_used": backend,
+                        "analysis_error": str(exc),
+                        "analysis_mode": task.get("analysis_mode"),
+                        "task_description": "",
+                        "llm_prompt": None,
+                        "llm_raw_output": None,
+                    }
         return results, max_workers
 
     def _prepare_copd_teacher_signals(
@@ -1853,24 +1871,34 @@ class RayPPOTrainer:
             }
         analyzed, analysis_workers = self._analyze_copd_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
         episode_analysis.update(analyzed)
+        successful_episode_analysis = {
+            traj_uid: analysis
+            for traj_uid, analysis in episode_analysis.items()
+            if not analysis.get("analysis_error") and str(analysis.get("episode_hint", "")).strip()
+        }
+        failed_analysis_count = len(episode_analysis) - len(successful_episode_analysis)
 
         critical_mask_np = np.zeros(batch_size, dtype=bool)
-        analyzed_traj_uids = set(episode_analysis.keys())
+        analyzed_traj_uids = set(successful_episode_analysis.keys())
         for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
             if sample_traj_uid in analyzed_traj_uids:
                 critical_mask_np[sample_idx] = True
         module_logger.info(
-            "COPD episode-level OPD selected %s steps from %s analyzed trajectories.",
+            "COPD episode-level OPD selected %s steps from %s successful analyzed trajectories (%s failed/skipped).",
             int(critical_mask_np.sum()),
             len(analyzed_traj_uids),
+            failed_analysis_count,
         )
         metrics["copd/analysis_num_requests"] = float(len(analysis_tasks))
         metrics["copd/analysis_num_workers"] = float(analysis_workers)
+        metrics["copd/analysis_succeeded_traj_count"] = float(len(successful_episode_analysis))
+        metrics["copd/analysis_failed_traj_count"] = float(failed_analysis_count)
         module_logger.info(
-            "COPD episode analysis finished: requests=%s, workers=%s, analyzed_trajectories=%s",
+            "COPD episode analysis finished: requests=%s, workers=%s, successful_trajectories=%s, failed_trajectories=%s",
             len(analysis_tasks),
             analysis_workers,
-            len(episode_analysis),
+            len(successful_episode_analysis),
+            failed_analysis_count,
         )
         self._dump_copd_analysis(
             analysis_tasks=analysis_tasks,
@@ -1921,6 +1949,7 @@ class RayPPOTrainer:
         if len(critical_indices) == 0:
             module_logger.info("COPD has no episode-level OPD steps for the current batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            metrics["copd/teacher_available"] = 0.0
             return batch
 
         if "multi_modal_inputs" in batch.non_tensor_batch:

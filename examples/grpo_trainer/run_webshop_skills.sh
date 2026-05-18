@@ -25,7 +25,7 @@ python3 -m examples.data_preprocess.prepare \
     --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=gigpo \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
@@ -62,6 +62,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.use_kl_in_reward=False \
+    algorithm.gigpo.step_advantage_w=0.0 \
+    algorithm.gigpo.mode=mean_std_norm \
     env.env_name=Webshop \
     env.seed=0 \
     env.max_steps=15 \

@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import os
@@ -225,7 +226,6 @@ class COPDEpisodeAnalyzer:
     def __init__(
         self,
         backend: str = "openai",
-        max_history_steps: int = 6,
         max_completion_tokens: int = 4096,
         max_step_hints_per_traj: int = 1,
     ):
@@ -237,18 +237,16 @@ class COPDEpisodeAnalyzer:
             raise ValueError(f"Unsupported COPD backend: {backend}")
 
         self.backend = backend
-        self.max_history_steps = max_history_steps
         self.max_completion_tokens = max_completion_tokens
         self.max_step_hints_per_traj = max(int(max_step_hints_per_traj), 0)
         self.client = None
         self.model = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
 
         logger.info(
-            "Initialized COPDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_history_steps=%s, max_completion_tokens=%s, max_step_hints_per_traj=%s",
+            "Initialized COPDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_completion_tokens=%s, max_step_hints_per_traj=%s",
             self.requested_backend,
             self.backend,
             self.model,
-            self.max_history_steps,
             self.max_completion_tokens,
             self.max_step_hints_per_traj,
         )
@@ -297,32 +295,111 @@ class COPDEpisodeAnalyzer:
             analysis_mode=analysis_mode,
             episode_success=episode_success,
         )
-        content = chat_completion_with_retry(
-            client=self._get_openai_client(),
-            model=self.model,
-            prompt=prompt,
-            retries=max(1, int(os.environ.get("OPENAI_API_RETRIES", "5"))),
-            retry_delay=float(os.environ.get("OPENAI_API_RETRY_DELAY", "1.0")),
-            max_completion_tokens=self.max_completion_tokens,
+        parse_attempts = self._get_parse_attempts()
+        content = ""
+        last_error: Optional[BaseException] = None
+        for parse_attempt in range(parse_attempts):
+            prompt_for_attempt = (
+                prompt
+                if parse_attempt == 0
+                else self._build_json_retry_prompt(
+                    original_prompt=prompt,
+                    invalid_response=content,
+                    error=last_error,
+                )
+            )
+            content = chat_completion_with_retry(
+                client=self._get_openai_client(),
+                model=self.model,
+                prompt=prompt_for_attempt,
+                retries=max(1, int(os.environ.get("OPENAI_API_RETRIES", "5"))),
+                retry_delay=float(os.environ.get("OPENAI_API_RETRY_DELAY", "1.0")),
+                max_completion_tokens=self.max_completion_tokens,
+            )
+            try:
+                parsed = self._parse_analysis_response(content)
+            except ValueError as exc:
+                last_error = exc
+                logger.warning(
+                    "COPD analyzer JSON parse failed on attempt %s/%s: %s",
+                    parse_attempt + 1,
+                    parse_attempts,
+                    exc,
+                )
+                continue
+
+            candidate_step_set = set(candidate_list)
+            filtered_step_hints = {
+                step_idx: hint
+                for step_idx, hint in parsed.get("step_hints", {}).items()
+                if step_idx in candidate_step_set
+            }
+            parsed["step_hints"] = dict(
+                list(filtered_step_hints.items())[: self.max_step_hints_per_traj]
+            )
+            parsed["analysis_backend_requested"] = self.requested_backend
+            parsed["analysis_backend_used"] = "openai"
+            parsed["analysis_error"] = None
+            parsed["analysis_mode"] = analysis_mode
+            parsed["task_description"] = task_description or self._infer_task_description(steps)
+            parsed["llm_prompt"] = prompt_for_attempt
+            parsed["llm_raw_output"] = content
+            return parsed
+
+        logger.warning(
+            "COPD analyzer failed to produce valid JSON after %s attempt(s); skipping teacher hint for this trajectory: %s",
+            parse_attempts,
+            last_error,
         )
-        parsed = self._parse_analysis_response(content)
-        candidate_step_set = set(candidate_list)
-        filtered_step_hints = {
-            step_idx: hint
-            for step_idx, hint in parsed.get("step_hints", {}).items()
-            if step_idx in candidate_step_set
+        return {
+            "episode_summary": "",
+            "episode_hint": "",
+            "step_hints": {},
+            "analysis_backend_requested": self.requested_backend,
+            "analysis_backend_used": "openai",
+            "analysis_error": str(last_error) if last_error is not None else "unknown JSON parse error",
+            "analysis_mode": analysis_mode,
+            "task_description": task_description or self._infer_task_description(steps),
+            "llm_prompt": prompt,
+            "llm_raw_output": content,
         }
-        parsed["step_hints"] = dict(
-            list(filtered_step_hints.items())[: self.max_step_hints_per_traj]
-        )
-        parsed["analysis_backend_requested"] = self.requested_backend
-        parsed["analysis_backend_used"] = "openai"
-        parsed["analysis_error"] = None
-        parsed["analysis_mode"] = analysis_mode
-        parsed["task_description"] = task_description or self._infer_task_description(steps)
-        parsed["llm_prompt"] = prompt
-        parsed["llm_raw_output"] = content
-        return parsed
+
+    def _get_parse_attempts(self) -> int:
+        raw_attempts = os.environ.get("COPD_ANALYSIS_PARSE_RETRIES", "2")
+        try:
+            return max(1, int(raw_attempts))
+        except (TypeError, ValueError):
+            logger.warning("Invalid COPD_ANALYSIS_PARSE_RETRIES=%r; using 2.", raw_attempts)
+            return 2
+
+    def _build_json_retry_prompt(
+        self,
+        original_prompt: Dict[str, Any],
+        invalid_response: str,
+        error: Optional[BaseException],
+    ) -> Dict[str, Any]:
+        messages = original_prompt.get("messages", []) if isinstance(original_prompt, dict) else []
+        original_user_prompt = ""
+        for message in messages:
+            if message.get("role") == "user":
+                original_user_prompt = str(message.get("content", ""))
+                break
+        invalid_preview = str(invalid_response or "")[-2000:]
+        retry_prompt = f"""{original_user_prompt}
+
+The previous answer could not be parsed as the required JSON object.
+Parse error: {error}
+
+Previous answer:
+{invalid_preview}
+
+Return ONLY one valid JSON object with this exact shape:
+{{
+  "episode_hint": "string",
+  "step_hints": {{}}
+}}
+"""
+        return build_prompt_dict(user_prompt=retry_prompt)
 
     def _infer_task_description(self, steps: List[Dict[str, object]]) -> str:
         for step in steps:
@@ -409,11 +486,7 @@ Episode context:
         return build_prompt_dict(user_prompt=prompt_text)
 
     def _parse_analysis_response(self, response: str) -> Dict[str, object]:
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        if json_start == -1 or json_end <= json_start:
-            raise ValueError("No JSON object found in COPD analyzer response.")
-        parsed = json.loads(response[json_start:json_end])
+        parsed = self._extract_json_object(response)
         if "episode_hint" not in parsed:
             raise ValueError("COPD analyzer response missing required field: episode_hint")
         step_hints_raw = parsed.get("step_hints", {}) or {}
@@ -429,6 +502,109 @@ Episode context:
             "episode_hint": str(parsed["episode_hint"]),
             "step_hints": step_hints,
         }
+
+    def _extract_json_object(self, response: str) -> Dict[str, object]:
+        response_text = str(response or "")
+        candidate_texts = self._candidate_json_texts(response_text)
+        decoded_objects: List[Dict[str, object]] = []
+        saw_object_start = False
+        last_error: Optional[BaseException] = None
+
+        for text in candidate_texts:
+            if "{" in text:
+                saw_object_start = True
+            for variant in self._json_text_variants(text):
+                objects, error = self._decode_json_objects(variant)
+                decoded_objects.extend(objects)
+                if error is not None:
+                    last_error = error
+
+        for obj in decoded_objects:
+            if "episode_hint" in obj:
+                return obj
+        if decoded_objects:
+            return decoded_objects[0]
+        if not saw_object_start:
+            raise ValueError("No JSON object found in COPD analyzer response.")
+        raise ValueError(f"Could not parse JSON object in COPD analyzer response: {last_error}") from last_error
+
+    def _candidate_json_texts(self, response_text: str) -> List[str]:
+        fenced_blocks = re.findall(
+            r"```(?:json|JSON)?\s*(.*?)```",
+            response_text,
+            flags=re.DOTALL,
+        )
+        candidates = [block.strip() for block in fenced_blocks if block.strip()]
+        candidates.append(response_text.strip())
+        return candidates
+
+    def _json_text_variants(self, text: str) -> List[str]:
+        repaired_trailing_commas = re.sub(r",\s*([}\]])", r"\1", text)
+        if repaired_trailing_commas == text:
+            return [text]
+        return [text, repaired_trailing_commas]
+
+    def _decode_json_objects(self, text: str) -> Tuple[List[Dict[str, object]], Optional[BaseException]]:
+        objects: List[Dict[str, object]] = []
+        last_error: Optional[BaseException] = None
+        decoder = json.JSONDecoder(strict=False)
+
+        for idx, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(text, idx)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                continue
+            if isinstance(parsed, dict):
+                objects.append(parsed)
+
+        if objects:
+            return objects, last_error
+
+        for json_slice in self._balanced_object_slices(text):
+            try:
+                parsed = ast.literal_eval(json_slice)
+            except (SyntaxError, ValueError) as exc:
+                last_error = exc
+                continue
+            if isinstance(parsed, dict):
+                objects.append(parsed)
+        return objects, last_error
+
+    def _balanced_object_slices(self, text: str) -> List[str]:
+        slices = []
+        start: Optional[int] = None
+        depth = 0
+        in_string = False
+        quote_char = ""
+        escape = False
+
+        for idx, char in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if in_string:
+                if char == "\\":
+                    escape = True
+                elif char == quote_char:
+                    in_string = False
+                continue
+            if char in {"'", '"'}:
+                in_string = True
+                quote_char = char
+                continue
+            if char == "{":
+                if depth == 0:
+                    start = idx
+                depth += 1
+            elif char == "}" and depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    slices.append(text[start:idx + 1])
+                    start = None
+        return slices
 
     def _format_episode_steps(self, steps: List[Dict[str, object]]) -> str:
         step_lines = []
