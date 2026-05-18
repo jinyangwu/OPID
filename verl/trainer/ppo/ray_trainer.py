@@ -261,6 +261,8 @@ def compute_advantage(
     gigpo_enable_similarity=False,
     gigpo_similarity_thresh=0.95,
     teacher_advantage_w=1.0,
+    episode_hint_teacher_advantage_w=None,
+    step_hint_teacher_advantage_w=0.0,
     copd_mode="mean_norm",
     copd_enable_similarity=False,
     copd_similarity_thresh=0.95,
@@ -389,6 +391,16 @@ def compute_advantage(
         data.meta_info["gigpo_adv_metrics"] = gigpo_adv_metrics
     elif adv_estimator == AdvantageEstimator.COPD:
         teacher_log_prob = data.batch['teacher_log_prob'] if 'teacher_log_prob' in data.batch.keys() else None
+        episode_teacher_log_prob = (
+            data.batch['episode_teacher_log_prob']
+            if 'episode_teacher_log_prob' in data.batch.keys()
+            else None
+        )
+        step_teacher_log_prob = (
+            data.batch['step_teacher_log_prob']
+            if 'step_teacher_log_prob' in data.batch.keys()
+            else None
+        )
         old_log_prob = data.batch['old_log_probs'] if 'old_log_probs' in data.batch.keys() else None
         if 'critical_step_mask' in data.batch.keys():
             critical_step_mask = data.batch['critical_step_mask']
@@ -396,6 +408,12 @@ def compute_advantage(
             critical_step_mask = data.non_tensor_batch['critical_step_mask']
         else:
             critical_step_mask = None
+        if 'step_hint_mask' in data.batch.keys():
+            step_hint_mask = data.batch['step_hint_mask']
+        elif 'step_hint_mask' in data.non_tensor_batch.keys():
+            step_hint_mask = data.non_tensor_batch['step_hint_mask']
+        else:
+            step_hint_mask = None
 
         advantages, returns, copd_adv_metrics = core_gigpo.compute_copd_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
@@ -405,10 +423,15 @@ def compute_advantage(
             index=data.non_tensor_batch['uid'],
             traj_index=data.non_tensor_batch['traj_uid'],
             teacher_log_prob=teacher_log_prob,
+            episode_teacher_log_prob=episode_teacher_log_prob,
+            step_teacher_log_prob=step_teacher_log_prob,
             old_log_prob=old_log_prob,
             critical_step_mask=critical_step_mask,
+            step_hint_mask=step_hint_mask,
             step_advantage_w=step_advantage_w,
             teacher_advantage_w=teacher_advantage_w,
+            episode_hint_teacher_advantage_w=episode_hint_teacher_advantage_w,
+            step_hint_teacher_advantage_w=step_hint_teacher_advantage_w,
             mode=copd_mode,
             enable_similarity=copd_enable_similarity,
             similarity_thresh=copd_similarity_thresh,
@@ -666,7 +689,14 @@ class RayPPOTrainer:
     def _set_zero_copd_teacher_signals(self, batch: DataProto, metrics: Dict[str, float]) -> DataProto:
         batch_size = len(batch)
         batch.batch["teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        batch.batch["episode_teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        batch.batch["step_teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
         batch.batch["critical_step_mask"] = torch.zeros(
+            batch_size,
+            dtype=torch.bool,
+            device=batch.batch["responses"].device,
+        )
+        batch.batch["step_hint_mask"] = torch.zeros(
             batch_size,
             dtype=torch.bool,
             device=batch.batch["responses"].device,
@@ -738,7 +768,22 @@ class RayPPOTrainer:
     ) -> DataProto:
         source_indices = batch.non_tensor_batch.get("_batch_source_idx")
         teacher_log_prob = teacher_signal_batch.batch["teacher_log_prob"]
+        episode_teacher_log_prob = (
+            teacher_signal_batch.batch["episode_teacher_log_prob"]
+            if "episode_teacher_log_prob" in teacher_signal_batch.batch.keys()
+            else teacher_log_prob
+        )
+        step_teacher_log_prob = (
+            teacher_signal_batch.batch["step_teacher_log_prob"]
+            if "step_teacher_log_prob" in teacher_signal_batch.batch.keys()
+            else torch.zeros_like(teacher_log_prob, dtype=torch.float32)
+        )
         critical_step_mask = teacher_signal_batch.batch["critical_step_mask"]
+        step_hint_mask = (
+            teacher_signal_batch.batch["step_hint_mask"]
+            if "step_hint_mask" in teacher_signal_batch.batch.keys()
+            else torch.zeros_like(critical_step_mask, dtype=torch.bool)
+        )
         if "teacher_signal_mask" in teacher_signal_batch.batch.keys():
             teacher_signal_mask = teacher_signal_batch.batch["teacher_signal_mask"]
         else:
@@ -751,11 +796,17 @@ class RayPPOTrainer:
                 device=teacher_log_prob.device,
             )
             teacher_log_prob = teacher_log_prob.index_select(0, gather_idx)
+            episode_teacher_log_prob = episode_teacher_log_prob.index_select(0, gather_idx)
+            step_teacher_log_prob = step_teacher_log_prob.index_select(0, gather_idx)
             critical_step_mask = critical_step_mask.index_select(0, gather_idx)
+            step_hint_mask = step_hint_mask.index_select(0, gather_idx)
             teacher_signal_mask = teacher_signal_mask.index_select(0, gather_idx)
 
         batch.batch["teacher_log_prob"] = teacher_log_prob
+        batch.batch["episode_teacher_log_prob"] = episode_teacher_log_prob
+        batch.batch["step_teacher_log_prob"] = step_teacher_log_prob
         batch.batch["critical_step_mask"] = critical_step_mask
+        batch.batch["step_hint_mask"] = step_hint_mask
         batch.batch["teacher_signal_mask"] = teacher_signal_mask
         batch.non_tensor_batch.pop("_batch_source_idx", None)
         return batch
@@ -791,10 +842,18 @@ class RayPPOTrainer:
                 failed_only_after_steps,
             )
         teacher_advantage_w = float(OmegaConf.select(config, "algorithm.copd.teacher_advantage_w") or 0.0)
+        episode_hint_teacher_advantage_w = OmegaConf.select(config, "algorithm.copd.episode_hint_teacher_advantage_w")
+        step_hint_teacher_advantage_w = float(
+            OmegaConf.select(config, "algorithm.copd.step_hint_teacher_advantage_w") or 0.0
+        )
         teacher_advantage_w_start = OmegaConf.select(config, "algorithm.copd.teacher_advantage_w_start")
         teacher_advantage_w_ramp_steps = OmegaConf.select(config, "algorithm.copd.teacher_advantage_w_ramp_steps")
         if teacher_advantage_w < 0:
             raise ValueError("algorithm.copd.teacher_advantage_w must be non-negative.")
+        if episode_hint_teacher_advantage_w is not None and float(episode_hint_teacher_advantage_w) < 0:
+            raise ValueError("algorithm.copd.episode_hint_teacher_advantage_w must be null or a non-negative number.")
+        if step_hint_teacher_advantage_w < 0:
+            raise ValueError("algorithm.copd.step_hint_teacher_advantage_w must be non-negative.")
         if teacher_advantage_w_start is not None and float(teacher_advantage_w_start) < 0:
             raise ValueError("algorithm.copd.teacher_advantage_w_start must be null or a non-negative number.")
         if teacher_advantage_w_start is None and teacher_advantage_w_ramp_steps is not None:
@@ -1737,6 +1796,7 @@ class RayPPOTrainer:
         response_mask = compute_response_mask(batch)
         zero_teacher_log_prob = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
         zero_critical_mask = torch.zeros(batch_size, dtype=torch.bool, device=batch.batch["responses"].device)
+        zero_step_hint_mask = torch.zeros(batch_size, dtype=torch.bool, device=batch.batch["responses"].device)
         batch.batch["teacher_signal_mask"] = zero_critical_mask.clone()
         traj_uids = batch.non_tensor_batch.get("traj_uid", [])
         num_trajectories = len(set(traj_uids)) if len(traj_uids) > 0 else 0
@@ -1748,7 +1808,10 @@ class RayPPOTrainer:
                 num_trajectories,
             )
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+            batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = zero_critical_mask
+            batch.batch["step_hint_mask"] = zero_step_hint_mask
             metrics["copd/analysis_enabled"] = 0.0
             metrics["copd/analysis_disabled"] = 1.0
             metrics["copd/analysis_num_requests"] = 0.0
@@ -1785,7 +1848,10 @@ class RayPPOTrainer:
         if "obs_text" not in batch.non_tensor_batch:
             module_logger.warning("COPD teacher signal skipped because obs_text is missing from the rollout batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+            batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = zero_critical_mask
+            batch.batch["step_hint_mask"] = zero_step_hint_mask
             metrics["copd/critical_step_ratio"] = 0.0
             metrics["copd/teacher_batch_size"] = 0.0
             metrics["copd/teacher_available"] = 0.0
@@ -1928,7 +1994,10 @@ class RayPPOTrainer:
 
         if not teacher_enabled:
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+            batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = critical_mask
+            batch.batch["step_hint_mask"] = zero_step_hint_mask
             metrics["copd/teacher_batch_size"] = 0.0
             metrics["copd/teacher_available"] = 0.0
             teacher_start_after_steps = self._get_copd_opd_start_after_steps()
@@ -1949,22 +2018,36 @@ class RayPPOTrainer:
         if len(critical_indices) == 0:
             module_logger.info("COPD has no episode-level OPD steps for the current batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+            batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
+            batch.batch["step_hint_mask"] = zero_step_hint_mask
             metrics["copd/teacher_available"] = 0.0
             return batch
 
         if "multi_modal_inputs" in batch.non_tensor_batch:
             module_logger.warning("COPD teacher signal skipped for the current batch because multi_modal_inputs are present.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+            batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
+            batch.batch["critical_step_mask"] = zero_critical_mask
+            batch.batch["step_hint_mask"] = zero_step_hint_mask
+            batch.batch["teacher_signal_mask"] = zero_critical_mask
             metrics["copd/teacher_skipped_multimodal"] = 1.0
             return batch
 
-        enhanced_obs_texts = []
-        data_sources = []
+        episode_obs_texts = []
+        episode_data_sources = []
+        step_obs_texts = []
+        step_data_sources = []
+        step_hint_indices = []
         augmented_observation_dump_entries: List[Dict[str, object]] = []
         critical_response_mask = response_mask[critical_indices]
         critical_responses = batch.batch["responses"][critical_indices]
         critical_preview = []
         step_hint_guided_steps = 0
+        step_hint_teacher_enabled = (
+            float(OmegaConf.select(self.config, "algorithm.copd.step_hint_teacher_advantage_w") or 0.0) > 0.0
+        )
 
         for sample_idx in critical_indices:
             traj_uid = batch.non_tensor_batch["traj_uid"][sample_idx]
@@ -1974,13 +2057,27 @@ class RayPPOTrainer:
             episode_summary = str(analysis.get("episode_summary", ""))
             episode_hint = str(analysis["episode_hint"])
             step_hint = str(analysis.get("step_hints", {}).get(step_idx, ""))
-            step_hint_guided_steps += int(bool(step_hint.strip()))
-            enhanced_obs = build_augmented_observation_text(
+            data_source = (
+                batch.non_tensor_batch["data_source"][sample_idx]
+                if "data_source" in batch.non_tensor_batch
+                else None
+            )
+            episode_enhanced_obs = build_augmented_observation_text(
                 observation=observation_text,
                 episode_hint=episode_hint,
-                step_hint=step_hint,
             )
-            enhanced_obs_texts.append(enhanced_obs)
+            episode_obs_texts.append(episode_enhanced_obs)
+            episode_data_sources.append(data_source)
+            step_enhanced_obs = ""
+            if step_hint.strip() and step_hint_teacher_enabled:
+                step_hint_guided_steps += 1
+                step_enhanced_obs = build_augmented_observation_text(
+                    observation=observation_text,
+                    step_hint=step_hint,
+                )
+                step_obs_texts.append(step_enhanced_obs)
+                step_data_sources.append(data_source)
+                step_hint_indices.append(int(sample_idx))
             augmented_observation_dump_entries.append(
                 {
                     "global_step": int(self.global_steps),
@@ -1989,16 +2086,13 @@ class RayPPOTrainer:
                     "step_idx": step_idx,
                     "analysis_mode": analysis.get("analysis_mode"),
                     "observation": observation_text,
-                    "augmented_observation": enhanced_obs,
+                    "augmented_observation": episode_enhanced_obs,
+                    "episode_augmented_observation": episode_enhanced_obs,
+                    "step_augmented_observation": step_enhanced_obs,
                     "episode_summary": episode_summary,
                     "episode_hint": episode_hint,
                     "step_hint": step_hint,
                 }
-            )
-            data_sources.append(
-                batch.non_tensor_batch["data_source"][sample_idx]
-                if "data_source" in batch.non_tensor_batch
-                else None
             )
             if len(critical_preview) < 3:
                 critical_preview.append(
@@ -2018,65 +2112,117 @@ class RayPPOTrainer:
         metrics["copd/step_hint_guidance/step_hints_applied"] = float(step_hint_guided_steps)
 
         module_logger.info(
-            "COPD built %s episode-level enhanced observations for teacher scoring across %s trajectories (%s with step hints).",
-            len(enhanced_obs_texts),
+            "COPD built %s episode-hint and %s step-hint observations for teacher scoring across %s trajectories.",
+            len(episode_obs_texts),
+            len(step_obs_texts),
             len({batch.non_tensor_batch['traj_uid'][sample_idx] for sample_idx in critical_indices}),
-            step_hint_guided_steps,
         )
         if critical_preview and module_logger.isEnabledFor(logging.DEBUG):
             module_logger.debug("COPD episode-level OPD preview: %s", critical_preview)
         self._dump_copd_augmented_observations(augmented_observation_dump_entries)
 
-        teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
-            obs_contents=enhanced_obs_texts,
-            data_sources=data_sources,
-            meta_info=deepcopy(batch.meta_info),
-        )
-        teacher_prompt_lengths = teacher_prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
-        module_logger.info(
-            "COPD teacher prompt lengths: min=%s, mean=%.2f, max=%s",
-            int(teacher_prompt_lengths.min()),
-            float(teacher_prompt_lengths.mean()),
-            int(teacher_prompt_lengths.max()),
-        )
+        def _compute_hint_log_probs(
+            *,
+            label: str,
+            obs_texts: List[str],
+            responses: torch.Tensor,
+            response_masks: torch.Tensor,
+            data_sources: List[object],
+        ) -> torch.Tensor:
+            teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
+                obs_contents=obs_texts,
+                data_sources=data_sources,
+                meta_info=deepcopy(batch.meta_info),
+            )
+            prompt_lengths = teacher_prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
+            module_logger.info(
+                "COPD %s teacher prompt lengths: min=%s, mean=%.2f, max=%s",
+                label,
+                int(prompt_lengths.min()),
+                float(prompt_lengths.mean()),
+                int(prompt_lengths.max()),
+            )
 
-        teacher_input_ids = torch.cat([teacher_prompt_batch.batch["input_ids"], critical_responses], dim=-1)
-        teacher_attention_mask = torch.cat(
-            [teacher_prompt_batch.batch["attention_mask"], critical_response_mask.to(dtype=teacher_prompt_batch.batch["attention_mask"].dtype)],
-            dim=-1,
-        )
-        teacher_position_ids = torch.clip(torch.cumsum(teacher_attention_mask, dim=-1) - 1, min=0)
+            teacher_input_ids = torch.cat([teacher_prompt_batch.batch["input_ids"], responses], dim=-1)
+            teacher_attention_mask = torch.cat(
+                [
+                    teacher_prompt_batch.batch["attention_mask"],
+                    response_masks.to(dtype=teacher_prompt_batch.batch["attention_mask"].dtype),
+                ],
+                dim=-1,
+            )
+            teacher_position_ids = torch.clip(torch.cumsum(teacher_attention_mask, dim=-1) - 1, min=0)
+            teacher_batch = DataProto.from_dict(
+                tensors={
+                    "responses": responses,
+                    "input_ids": teacher_input_ids,
+                    "attention_mask": teacher_attention_mask,
+                    "position_ids": teacher_position_ids,
+                },
+                meta_info=deepcopy(batch.meta_info),
+            )
+            teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(
+                teacher_batch,
+                self.actor_rollout_wg.world_size,
+            )
+            teacher_log_prob_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
+            teacher_log_prob = unpad_dataproto(teacher_log_prob_padded, pad_size=teacher_pad_size)
+            return teacher_log_prob.batch["old_log_probs"]
 
-        teacher_batch = DataProto.from_dict(
-            tensors={
-                "responses": critical_responses,
-                "input_ids": teacher_input_ids,
-                "attention_mask": teacher_attention_mask,
-                "position_ids": teacher_position_ids,
-            },
-            meta_info=deepcopy(batch.meta_info),
+        episode_teacher_lp = _compute_hint_log_probs(
+            label="episode-hint",
+            obs_texts=episode_obs_texts,
+            responses=critical_responses,
+            response_masks=critical_response_mask,
+            data_sources=episode_data_sources,
         )
-        teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(teacher_batch, self.actor_rollout_wg.world_size)
-        teacher_log_prob_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
-        teacher_log_prob = unpad_dataproto(teacher_log_prob_padded, pad_size=teacher_pad_size)
+        full_episode_teacher_log_prob = zero_teacher_log_prob.clone()
+        full_episode_teacher_log_prob[critical_indices] = episode_teacher_lp
+        full_step_teacher_log_prob = zero_teacher_log_prob.clone()
+        step_hint_mask_np = np.zeros(batch_size, dtype=bool)
+        metrics["copd/step_hint_teacher_log_prob_mean"] = 0.0
+        if step_hint_indices:
+            step_hint_mask_np[step_hint_indices] = True
+            step_hint_tensor_indices = torch.as_tensor(
+                step_hint_indices,
+                dtype=torch.long,
+                device=batch.batch["responses"].device,
+            )
+            step_teacher_lp = _compute_hint_log_probs(
+                label="step-hint",
+                obs_texts=step_obs_texts,
+                responses=batch.batch["responses"].index_select(0, step_hint_tensor_indices),
+                response_masks=response_mask.index_select(0, step_hint_tensor_indices),
+                data_sources=step_data_sources,
+            )
+            full_step_teacher_log_prob[step_hint_indices] = step_teacher_lp
+            metrics["copd/step_hint_teacher_log_prob_mean"] = float(
+                step_teacher_lp.mean().detach().cpu().item()
+            )
 
-        full_teacher_log_prob = zero_teacher_log_prob
-        full_teacher_log_prob[critical_indices] = teacher_log_prob.batch["old_log_probs"]
-        batch.batch["teacher_log_prob"] = full_teacher_log_prob
+        step_hint_mask = torch.as_tensor(
+            step_hint_mask_np,
+            device=batch.batch["responses"].device,
+            dtype=torch.bool,
+        )
+        batch.batch["teacher_log_prob"] = full_episode_teacher_log_prob
+        batch.batch["episode_teacher_log_prob"] = full_episode_teacher_log_prob
+        batch.batch["step_teacher_log_prob"] = full_step_teacher_log_prob
+        batch.batch["step_hint_mask"] = step_hint_mask
         batch.batch["teacher_signal_mask"] = critical_mask
-        teacher_lp = teacher_log_prob.batch["old_log_probs"]
 
         module_logger.info(
-            "COPD computed teacher log-probs for %s OPD-scored steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
+            "COPD computed episode-hint teacher log-probs for %s OPD-scored steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
             len(critical_indices),
-            float(teacher_lp.mean().detach().cpu().item()),
-            float(teacher_lp.min().detach().cpu().item()),
-            float(teacher_lp.max().detach().cpu().item()),
+            float(episode_teacher_lp.mean().detach().cpu().item()),
+            float(episode_teacher_lp.min().detach().cpu().item()),
+            float(episode_teacher_lp.max().detach().cpu().item()),
         )
         if len(critical_indices) > 0:
             metrics["copd/teacher_log_prob_mean"] = float(
-                teacher_lp.mean().detach().cpu().item()
+                episode_teacher_lp.mean().detach().cpu().item()
             )
+            metrics["copd/episode_hint_teacher_log_prob_mean"] = metrics["copd/teacher_log_prob_mean"]
         return batch
 
     def _save_checkpoint(self):
@@ -2445,8 +2591,29 @@ class RayPPOTrainer:
                                 teacher_enabled=copd_teacher_adv_enabled
                             )
                             metrics["copd/teacher_advantage_w_current"] = float(copd_teacher_advantage_w)
+                            episode_hint_teacher_advantage_w = OmegaConf.select(
+                                self.config,
+                                "algorithm.copd.episode_hint_teacher_advantage_w",
+                            )
+                            if not copd_teacher_adv_enabled:
+                                episode_hint_teacher_advantage_w = 0.0
+                            elif episode_hint_teacher_advantage_w is not None:
+                                episode_hint_teacher_advantage_w = float(episode_hint_teacher_advantage_w)
+                            step_hint_teacher_advantage_w = (
+                                float(OmegaConf.select(self.config, "algorithm.copd.step_hint_teacher_advantage_w") or 0.0)
+                                if copd_teacher_adv_enabled
+                                else 0.0
+                            )
+                            metrics["copd/episode_hint_teacher_advantage_w_current"] = float(
+                                copd_teacher_advantage_w
+                                if episode_hint_teacher_advantage_w is None
+                                else episode_hint_teacher_advantage_w
+                            )
+                            metrics["copd/step_hint_teacher_advantage_w_current"] = float(step_hint_teacher_advantage_w)
                         else:
                             copd_teacher_advantage_w = 0.0
+                            episode_hint_teacher_advantage_w = None
+                            step_hint_teacher_advantage_w = 0.0
 
                         batch = compute_advantage(
                             batch,
@@ -2468,6 +2635,8 @@ class RayPPOTrainer:
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                             teacher_advantage_w=copd_teacher_advantage_w,
+                            episode_hint_teacher_advantage_w=episode_hint_teacher_advantage_w,
+                            step_hint_teacher_advantage_w=step_hint_teacher_advantage_w,
                             copd_mode=self.config.algorithm.copd.mode,
                             copd_enable_similarity=self.config.algorithm.copd.enable_similarity,
                             copd_similarity_thresh=self.config.algorithm.copd.similarity_thresh,

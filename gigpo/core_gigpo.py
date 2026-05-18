@@ -406,11 +406,16 @@ def compute_copd_advantage_components(
     index: np.array,
     traj_index: np.array,
     teacher_log_prob: Optional[torch.Tensor] = None,
+    episode_teacher_log_prob: Optional[torch.Tensor] = None,
+    step_teacher_log_prob: Optional[torch.Tensor] = None,
     old_log_prob: Optional[torch.Tensor] = None,
     critical_step_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
+    step_hint_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
     epsilon: float = 1e-6,
     step_advantage_w: float = 0.0,
     teacher_advantage_w: float = 1.0,
+    episode_hint_teacher_advantage_w: Optional[float] = None,
+    step_hint_teacher_advantage_w: float = 0.0,
     mode: str = "mean_norm",
     enable_similarity: bool = False,
     similarity_thresh: float = 0.95,
@@ -438,21 +443,44 @@ def compute_copd_advantage_components(
 
     step_advantages = torch.zeros_like(episode_advantages)
     step_group_metrics: Dict[str, float] = {}
+    episode_hint_weight = (
+        float(teacher_advantage_w)
+        if episode_hint_teacher_advantage_w is None
+        else float(episode_hint_teacher_advantage_w)
+    )
+    step_hint_weight = float(step_hint_teacher_advantage_w or 0.0)
 
-    teacher_advantages = compute_teacher_token_advantage(
+    episode_teacher_advantages = compute_teacher_token_advantage(
         response_mask=response_mask,
-        teacher_log_prob=teacher_log_prob,
+        teacher_log_prob=episode_teacher_log_prob if episode_teacher_log_prob is not None else teacher_log_prob,
         old_log_prob=old_log_prob,
         critical_step_mask=critical_step_mask,
         normalize=normalize_teacher_adv,
         clip_range=clip_teacher_adv,
         epsilon=epsilon,
     )
+    step_teacher_advantages = compute_teacher_token_advantage(
+        response_mask=response_mask,
+        teacher_log_prob=step_teacher_log_prob,
+        old_log_prob=old_log_prob,
+        critical_step_mask=step_hint_mask,
+        normalize=normalize_teacher_adv,
+        clip_range=clip_teacher_adv,
+        epsilon=epsilon,
+    )
+    teacher_advantages = (
+        episode_hint_weight * episode_teacher_advantages
+        + step_hint_weight * step_teacher_advantages
+    )
 
     scores = (
         episode_advantages
-        + teacher_advantage_w * teacher_advantages
+        + teacher_advantages
     )
+    step_group_metrics.update({
+        "copd/adv/episode_hint_teacher_weight": episode_hint_weight,
+        "copd/adv/step_hint_teacher_weight": step_hint_weight,
+    })
     return episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics
 
 # ---------------------------------------------------------- #
@@ -504,11 +532,16 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
                                    index: np.array,
                                    traj_index: np.array,
                                    teacher_log_prob: Optional[torch.Tensor] = None,
+                                   episode_teacher_log_prob: Optional[torch.Tensor] = None,
+                                   step_teacher_log_prob: Optional[torch.Tensor] = None,
                                    old_log_prob: Optional[torch.Tensor] = None,
                                    critical_step_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
+                                   step_hint_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
                                    epsilon: float = 1e-6,
                                    step_advantage_w: float = 0.0,
                                    teacher_advantage_w: float = 1.0,
+                                   episode_hint_teacher_advantage_w: Optional[float] = None,
+                                   step_hint_teacher_advantage_w: float = 0.0,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
                                    similarity_thresh: float = 0.95,
@@ -519,8 +552,8 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
     """
     Compute the advantages for COPD.
 
-    COPD uses only episode-level outcome advantages plus an episode-level
-    teacher term derived from ``teacher_log_prob - old_log_prob``.
+    COPD uses episode-level outcome advantages plus optional episode-hint and
+    step-hint teacher terms, each derived from enhanced-prompt log-probs.
     """
     episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics = compute_copd_advantage_components(
         token_level_rewards=token_level_rewards,
@@ -530,11 +563,16 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
         index=index,
         traj_index=traj_index,
         teacher_log_prob=teacher_log_prob,
+        episode_teacher_log_prob=episode_teacher_log_prob,
+        step_teacher_log_prob=step_teacher_log_prob,
         old_log_prob=old_log_prob,
         critical_step_mask=critical_step_mask,
+        step_hint_mask=step_hint_mask,
         epsilon=epsilon,
         step_advantage_w=step_advantage_w,
         teacher_advantage_w=teacher_advantage_w,
+        episode_hint_teacher_advantage_w=episode_hint_teacher_advantage_w,
+        step_hint_teacher_advantage_w=step_hint_teacher_advantage_w,
         mode=mode,
         enable_similarity=enable_similarity,
         similarity_thresh=similarity_thresh,
@@ -549,7 +587,7 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
             step_advantages=step_advantages,
             teacher_advantages=teacher_advantages,
             step_advantage_w=step_advantage_w,
-            teacher_advantage_w=teacher_advantage_w,
+            teacher_advantage_w=1.0,
             epsilon=epsilon,
         )
         component_metrics.update(step_group_metrics)

@@ -258,6 +258,8 @@ algorithm:
   copd:
     step_advantage_w: 0.0 # COPD uses episode-level advantage only.
     teacher_advantage_w: 1.0
+    episode_hint_teacher_advantage_w: null # null -> use teacher_advantage_w; otherwise override episode-hint teacher weight
+    step_hint_teacher_advantage_w: 0.0 # separate weight for step-hint-only teacher signal
     opd_start_after_steps: null # null -> enable COPD teacher/OPD signal from the first training step; otherwise enable after this many completed steps
     teacher_advantage_w_start: null # null -> keep teacher_advantage_w constant; otherwise linearly ramp from start to teacher_advantage_w
     teacher_advantage_w_ramp_steps: null # null -> use remaining trainer.total_training_steps after opd_start_after_steps for the ramp length

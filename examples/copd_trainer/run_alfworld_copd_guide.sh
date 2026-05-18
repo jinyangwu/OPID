@@ -18,6 +18,8 @@ NUM_CPUS_PER_ENV_WORKER=0.1
 COPD_MODE=mean_norm
 COPD_STEP_ADV_W=0.0
 COPD_TEACHER_ADV_W=${COPD_TEACHER_ADV_W:-0.001}
+COPD_EPISODE_HINT_TEACHER_ADV_W=${COPD_EPISODE_HINT_TEACHER_ADV_W:-0.001}
+COPD_STEP_HINT_TEACHER_ADV_W=${COPD_STEP_HINT_TEACHER_ADV_W:-0.001}
 COPD_OPD_START_AFTER_STEPS=${COPD_OPD_START_AFTER_STEPS:-null}
 COPD_PHASE_SWITCH_AFTER_STEPS=${COPD_PHASE_SWITCH_AFTER_STEPS:-null}
 
@@ -86,6 +88,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$COPD_TEACHER_ADV_W \
+    algorithm.copd.episode_hint_teacher_advantage_w=$COPD_EPISODE_HINT_TEACHER_ADV_W \
+    algorithm.copd.step_hint_teacher_advantage_w=$COPD_STEP_HINT_TEACHER_ADV_W \
     algorithm.copd.opd_start_after_steps=$COPD_OPD_START_AFTER_STEPS \
     algorithm.copd.phase_switch_after_steps=$COPD_PHASE_SWITCH_AFTER_STEPS \
     algorithm.copd.failed_only=$COPD_FAILED_ONLY \

@@ -297,6 +297,8 @@ algorithm:
   copd:
     step_advantage_w: 0.0
     teacher_advantage_w: 1.0
+    episode_hint_teacher_advantage_w: null
+    step_hint_teacher_advantage_w: 0.0
     opd_start_after_steps: null
     teacher_advantage_w_start: null
     teacher_advantage_w_ramp_steps: null

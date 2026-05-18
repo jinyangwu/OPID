@@ -14,7 +14,9 @@ TRAIN_DATA_SIZE=${TRAIN_DATA_SIZE:-16}
 VAL_DATA_SIZE=${VAL_DATA_SIZE:-128}
 GROUP_SIZE=${GROUP_SIZE:-8}
 NUM_CPUS_PER_ENV_WORKER=${NUM_CPUS_PER_ENV_WORKER:-0.1}
-TEACHER_ADV_W=${TEACHER_ADV_W:-0.1}
+TEACHER_ADV_W=${TEACHER_ADV_W:-0.001}
+EPISODE_HINT_TEACHER_ADV_W=${EPISODE_HINT_TEACHER_ADV_W:-0.001}
+STEP_HINT_TEACHER_ADV_W=${STEP_HINT_TEACHER_ADV_W:-0.001}
 STEP_ADV_W=${STEP_ADV_W:-1.0}
 
 PROJECT_NAME=${PROJECT_NAME:-agentic_webshop}
@@ -68,6 +70,8 @@ python3 -m verl.trainer.main_ppo_skill_distill \
     algorithm.gamma=0.95 \
     algorithm.copd.step_advantage_w=$STEP_ADV_W \
     algorithm.copd.teacher_advantage_w=$TEACHER_ADV_W \
+    algorithm.copd.episode_hint_teacher_advantage_w=$EPISODE_HINT_TEACHER_ADV_W \
+    algorithm.copd.step_hint_teacher_advantage_w=$STEP_HINT_TEACHER_ADV_W \
     algorithm.copd.mode=mean_norm \
     algorithm.copd.normalize_teacher_adv=False \
     env.env_name=Webshop \
