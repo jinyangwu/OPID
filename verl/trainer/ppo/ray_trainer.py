@@ -2037,12 +2037,11 @@ class RayPPOTrainer:
 
         episode_obs_texts = []
         episode_data_sources = []
+        episode_hint_indices = []
         step_obs_texts = []
         step_data_sources = []
         step_hint_indices = []
         augmented_observation_dump_entries: List[Dict[str, object]] = []
-        critical_response_mask = response_mask[critical_indices]
-        critical_responses = batch.batch["responses"][critical_indices]
         critical_preview = []
         step_hint_guided_steps = 0
         step_hint_teacher_enabled = (
@@ -2062,13 +2061,8 @@ class RayPPOTrainer:
                 if "data_source" in batch.non_tensor_batch
                 else None
             )
-            episode_enhanced_obs = build_augmented_observation_text(
-                observation=observation_text,
-                episode_hint=episode_hint,
-            )
-            episode_obs_texts.append(episode_enhanced_obs)
-            episode_data_sources.append(data_source)
             step_enhanced_obs = ""
+            episode_enhanced_obs = ""
             if step_hint.strip() and step_hint_teacher_enabled:
                 step_hint_guided_steps += 1
                 step_enhanced_obs = build_augmented_observation_text(
@@ -2078,6 +2072,14 @@ class RayPPOTrainer:
                 step_obs_texts.append(step_enhanced_obs)
                 step_data_sources.append(data_source)
                 step_hint_indices.append(int(sample_idx))
+            else:
+                episode_enhanced_obs = build_augmented_observation_text(
+                    observation=observation_text,
+                    episode_hint=episode_hint,
+                )
+                episode_obs_texts.append(episode_enhanced_obs)
+                episode_data_sources.append(data_source)
+                episode_hint_indices.append(int(sample_idx))
             augmented_observation_dump_entries.append(
                 {
                     "global_step": int(self.global_steps),
@@ -2086,7 +2088,7 @@ class RayPPOTrainer:
                     "step_idx": step_idx,
                     "analysis_mode": analysis.get("analysis_mode"),
                     "observation": observation_text,
-                    "augmented_observation": episode_enhanced_obs,
+                    "augmented_observation": episode_enhanced_obs or step_enhanced_obs,
                     "episode_augmented_observation": episode_enhanced_obs,
                     "step_augmented_observation": step_enhanced_obs,
                     "episode_summary": episode_summary,
@@ -2109,7 +2111,12 @@ class RayPPOTrainer:
             metrics["copd/step_hint_guidance/step_guided_step_ratio"] = float(
                 step_hint_guided_steps / len(critical_indices)
             )
+            metrics["copd/episode_hint_guidance/episode_guided_step_ratio"] = float(
+                len(episode_hint_indices) / len(critical_indices)
+            )
         metrics["copd/step_hint_guidance/step_hints_applied"] = float(step_hint_guided_steps)
+        metrics["copd/episode_hint_guidance/episode_hints_applied"] = float(len(episode_hint_indices))
+        metrics["copd/teacher_batch_size"] = float(len(episode_hint_indices) + len(step_hint_indices))
 
         module_logger.info(
             "COPD built %s episode-hint and %s step-hint observations for teacher scoring across %s trajectories.",
@@ -2169,15 +2176,30 @@ class RayPPOTrainer:
             teacher_log_prob = unpad_dataproto(teacher_log_prob_padded, pad_size=teacher_pad_size)
             return teacher_log_prob.batch["old_log_probs"]
 
-        episode_teacher_lp = _compute_hint_log_probs(
-            label="episode-hint",
-            obs_texts=episode_obs_texts,
-            responses=critical_responses,
-            response_masks=critical_response_mask,
-            data_sources=episode_data_sources,
-        )
         full_episode_teacher_log_prob = zero_teacher_log_prob.clone()
-        full_episode_teacher_log_prob[critical_indices] = episode_teacher_lp
+        episode_hint_mask_np = np.zeros(batch_size, dtype=bool)
+        active_teacher_log_prob_chunks = []
+        metrics["copd/teacher_log_prob_mean"] = 0.0
+        metrics["copd/episode_hint_teacher_log_prob_mean"] = 0.0
+        if episode_hint_indices:
+            episode_hint_mask_np[episode_hint_indices] = True
+            episode_hint_tensor_indices = torch.as_tensor(
+                episode_hint_indices,
+                dtype=torch.long,
+                device=batch.batch["responses"].device,
+            )
+            episode_teacher_lp = _compute_hint_log_probs(
+                label="episode-hint",
+                obs_texts=episode_obs_texts,
+                responses=batch.batch["responses"].index_select(0, episode_hint_tensor_indices),
+                response_masks=response_mask.index_select(0, episode_hint_tensor_indices),
+                data_sources=episode_data_sources,
+            )
+            full_episode_teacher_log_prob[episode_hint_indices] = episode_teacher_lp
+            active_teacher_log_prob_chunks.append(episode_teacher_lp.reshape(-1))
+            metrics["copd/episode_hint_teacher_log_prob_mean"] = float(
+                episode_teacher_lp.mean().detach().cpu().item()
+            )
         full_step_teacher_log_prob = zero_teacher_log_prob.clone()
         step_hint_mask_np = np.zeros(batch_size, dtype=bool)
         metrics["copd/step_hint_teacher_log_prob_mean"] = 0.0
@@ -2196,33 +2218,46 @@ class RayPPOTrainer:
                 data_sources=step_data_sources,
             )
             full_step_teacher_log_prob[step_hint_indices] = step_teacher_lp
+            active_teacher_log_prob_chunks.append(step_teacher_lp.reshape(-1))
             metrics["copd/step_hint_teacher_log_prob_mean"] = float(
                 step_teacher_lp.mean().detach().cpu().item()
             )
 
+        episode_hint_mask = torch.as_tensor(
+            episode_hint_mask_np,
+            device=batch.batch["responses"].device,
+            dtype=torch.bool,
+        )
         step_hint_mask = torch.as_tensor(
             step_hint_mask_np,
             device=batch.batch["responses"].device,
             dtype=torch.bool,
         )
-        batch.batch["teacher_log_prob"] = full_episode_teacher_log_prob
+        teacher_signal_mask = episode_hint_mask | step_hint_mask
+        full_teacher_log_prob = full_episode_teacher_log_prob.clone()
+        full_teacher_log_prob[step_hint_mask] = full_step_teacher_log_prob[step_hint_mask]
+        if active_teacher_log_prob_chunks:
+            metrics["copd/teacher_log_prob_mean"] = float(
+                torch.cat(active_teacher_log_prob_chunks).mean().detach().cpu().item()
+            )
+
+        batch.batch["teacher_log_prob"] = full_teacher_log_prob
         batch.batch["episode_teacher_log_prob"] = full_episode_teacher_log_prob
         batch.batch["step_teacher_log_prob"] = full_step_teacher_log_prob
+        batch.batch["critical_step_mask"] = episode_hint_mask
         batch.batch["step_hint_mask"] = step_hint_mask
-        batch.batch["teacher_signal_mask"] = critical_mask
+        batch.batch["teacher_signal_mask"] = teacher_signal_mask
 
-        module_logger.info(
-            "COPD computed episode-hint teacher log-probs for %s OPD-scored steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
-            len(critical_indices),
-            float(episode_teacher_lp.mean().detach().cpu().item()),
-            float(episode_teacher_lp.min().detach().cpu().item()),
-            float(episode_teacher_lp.max().detach().cpu().item()),
-        )
-        if len(critical_indices) > 0:
-            metrics["copd/teacher_log_prob_mean"] = float(
-                episode_teacher_lp.mean().detach().cpu().item()
+        if episode_hint_indices:
+            module_logger.info(
+                "COPD computed episode-hint teacher log-probs for %s non-step-hint steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
+                len(episode_hint_indices),
+                float(episode_teacher_lp.mean().detach().cpu().item()),
+                float(episode_teacher_lp.min().detach().cpu().item()),
+                float(episode_teacher_lp.max().detach().cpu().item()),
             )
-            metrics["copd/episode_hint_teacher_log_prob_mean"] = metrics["copd/teacher_log_prob_mean"]
+        else:
+            module_logger.info("COPD skipped episode-hint teacher log-probs because all OPD-scored steps have step hints.")
         return batch
 
     def _save_checkpoint(self):

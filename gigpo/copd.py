@@ -395,6 +395,7 @@ Previous answer:
 
 Return ONLY one valid JSON object with this exact shape:
 {{
+  "episode_summary": "string",
   "episode_hint": "string",
   "step_hints": {{}}
 }}
@@ -434,42 +435,47 @@ Return ONLY one valid JSON object with this exact shape:
 
         if outcome_label == "success":
             episode_hint_instruction = (
-                "Write one reusable episode_hint that extracts the successful workflow: "
+                "Write one episode_hint that extracts the successful trajectory into workflow: "
                 "the core decision rule and action ordering that made this trajectory work. "
-                "Phrase it as a general skill pattern, not as instructions for this exact task."
+                # "Phrase it as a general skill pattern, not as instructions for this exact task."
             )
         elif outcome_label == "failure":
             episode_hint_instruction = (
-                "Write one reusable episode_hint that explains why the trajectory failed and how to avoid "
-                "that failure pattern next time. Focus on the core mistake and the safer general workflow. "
-                "Phrase it as a general avoidance skill pattern, not as a one-off lesson tied to this exact task."
+                "Write one episode_hint that extracts the failed trajectory into avoidance rules: "
+                "the core mistake and warning signs that agent should avoid. "
+                # "Phrase it as a general avoidance skill pattern, not as a one-off lesson tied to this exact task."
             )
         else:
             episode_hint_instruction = (
-                "Write one reusable episode_hint distilled from the trajectory. If it succeeded, extract "
-                "the successful workflow; if it failed, explain the failure cause and how to avoid it. "
-                "Make the hint a short, broadly reusable strategy for similar task patterns."
+                "Write one episode_hint distilled from the trajectory. If it succeeded, extract "
+                "the successful workflow; if it failed, extract the avoidance rules. "
             )
+
+        summary_instruction = "Write a concise episode_summary."
+        selection_instruction = (
+            f"Provide concise, action-oriented decision guidance for at most {max_hint_count} critical step(s) "
+            "from the candidate set as entries in step_hints; use the full episode to infer the guidance, "
+            "but phrase each hint as advice the policy can act on at that step."
+        )
         prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
 
-{episode_hint_instruction}
-
-Also write step_hints for at most {max_hint_count} critical step(s) from the candidate set. A step_hint is local guidance for only that step; choose the step(s) where extra current-step advice would most improve or secure the trajectory.
+You need to complete all three fields:
+1. {summary_instruction}
+2. {episode_hint_instruction}
+3. {selection_instruction}
 
 Important constraints:
 - Step indexing is 0-based: step 0 is the first step of the trajectory.
-- Use the full episode context.
-- Write episode_hint as sequence-level policy-facing guidance, not as a current-step instruction.
-- The episode_hint is used for every OPD-scored step in this episode.
-- step_hints are used only on their keyed critical steps.
-- step_hints keys must come from Candidate step indices.
-- Each step_hints value should be one short imperative sentence grounded in information available at or before that step.
-- Keep episode_hint concise: 1-2 sentences, ideally under 45 words.
-- Generalize away instance details: do not mention specific product names, colors, sizes, prices, brands, or quoted search terms from the task.
-- Do not list many warning signs or examples; include only the single reusable rule that should guide future behavior.
+- Use the task description together with the episode context to judge progress and mistakes.
+- Use the full episode context to identify what each critical step should have done better.
+- Each step_hints value should be one short imperative sentence for the policy at that step.
+- Write step_hints as policy-facing guidance, not as retrospective explanation of the trajectory.
+- Return only these top-level fields: episode_summary, episode_hint, step_hints.
+- The chosen steps are exactly the keys present in step_hints.
 
 Return format:
 {{
+  "episode_summary": "string",
   "episode_hint": "string",
   "step_hints": {{
     "0": "hint for step 0",
