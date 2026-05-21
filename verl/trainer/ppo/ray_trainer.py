@@ -1827,7 +1827,7 @@ class RayPPOTrainer:
 
         metrics["copd/analysis_enabled"] = 1.0
         metrics["copd/analysis_disabled"] = 0.0
-        metrics["copd/episode_hint_guidance/enabled"] = 1.0
+        metrics["copd/episode_hint_guidance/enabled"] = 0.0
         configured_failed_only = bool(OmegaConf.select(self.config, "algorithm.copd.failed_only"))
         failed_only_after_steps = self._get_copd_failed_only_after_steps()
         failed_only = self._should_copd_analyze_failed_only()
@@ -2044,8 +2044,22 @@ class RayPPOTrainer:
         augmented_observation_dump_entries: List[Dict[str, object]] = []
         critical_preview = []
         step_hint_guided_steps = 0
+        episode_hint_teacher_advantage_w = OmegaConf.select(
+            self.config,
+            "algorithm.copd.episode_hint_teacher_advantage_w",
+        )
+        episode_hint_teacher_weight = (
+            self._get_copd_teacher_advantage_weight(teacher_enabled=True)
+            if episode_hint_teacher_advantage_w is None
+            else float(episode_hint_teacher_advantage_w)
+        )
+        episode_hint_teacher_enabled = episode_hint_teacher_weight > 0.0
         step_hint_teacher_enabled = (
             float(OmegaConf.select(self.config, "algorithm.copd.step_hint_teacher_advantage_w") or 0.0) > 0.0
+        )
+        metrics["copd/episode_hint_guidance/enabled"] = 1.0 if episode_hint_teacher_enabled else 0.0
+        metrics["copd/episode_hint_teacher_skipped_zero_weight"] = (
+            0.0 if episode_hint_teacher_enabled else 1.0
         )
 
         for sample_idx in critical_indices:
@@ -2072,7 +2086,7 @@ class RayPPOTrainer:
                 step_obs_texts.append(step_enhanced_obs)
                 step_data_sources.append(data_source)
                 step_hint_indices.append(int(sample_idx))
-            else:
+            elif episode_hint_teacher_enabled:
                 episode_enhanced_obs = build_augmented_observation_text(
                     observation=observation_text,
                     episode_hint=episode_hint,
@@ -2117,6 +2131,7 @@ class RayPPOTrainer:
         metrics["copd/step_hint_guidance/step_hints_applied"] = float(step_hint_guided_steps)
         metrics["copd/episode_hint_guidance/episode_hints_applied"] = float(len(episode_hint_indices))
         metrics["copd/teacher_batch_size"] = float(len(episode_hint_indices) + len(step_hint_indices))
+        metrics["copd/teacher_available"] = 1.0 if (episode_hint_indices or step_hint_indices) else 0.0
 
         module_logger.info(
             "COPD built %s episode-hint and %s step-hint observations for teacher scoring across %s trajectories.",
@@ -2255,6 +2270,11 @@ class RayPPOTrainer:
                 float(episode_teacher_lp.mean().detach().cpu().item()),
                 float(episode_teacher_lp.min().detach().cpu().item()),
                 float(episode_teacher_lp.max().detach().cpu().item()),
+            )
+        elif not episode_hint_teacher_enabled:
+            module_logger.info(
+                "COPD skipped episode-hint teacher log-probs because episode_hint_teacher_advantage_w is %.6f.",
+                episode_hint_teacher_weight,
             )
         else:
             module_logger.info("COPD skipped episode-hint teacher log-probs because all OPD-scored steps have step hints.")
