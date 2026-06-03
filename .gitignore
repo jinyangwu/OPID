@@ -1,6 +1,8 @@
 gpu.sh
 ret.sh
 run.sh
+test_api.py
+test_webshop.py
 
 past
 **/*.pyc
