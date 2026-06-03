@@ -645,6 +645,14 @@ class RayPPOTrainer:
             self._copd_analysis_last_enabled_state = enabled
         return enabled
 
+    def _is_copd_singleton_only(self) -> bool:
+        configured = OmegaConf.select(self.config, "algorithm.copd.singleton_only")
+        if configured is None:
+            return False
+        if isinstance(configured, str):
+            return configured.lower() in ("1", "true", "yes", "on")
+        return bool(configured)
+
     def _is_copd_teacher_adv_enabled(self) -> bool:
         start_after_steps = self._get_copd_opd_start_after_steps()
         phase_switch_after_steps = self._get_copd_phase_switch_after_steps()
@@ -863,8 +871,12 @@ class RayPPOTrainer:
         if teacher_advantage_w_ramp_steps is not None and int(teacher_advantage_w_ramp_steps) <= 0:
             raise ValueError("algorithm.copd.teacher_advantage_w_ramp_steps must be null or a positive integer.")
         if config.algorithm.adv_estimator == AdvantageEstimator.COPD or str(config.algorithm.adv_estimator) == AdvantageEstimator.COPD.value:
-            if float(OmegaConf.select(config, "algorithm.copd.step_advantage_w") or 0.0) != 0.0:
-                raise ValueError("Episode-level COPD OPD requires algorithm.copd.step_advantage_w=0.0.")
+            singleton_only = self._is_copd_singleton_only()
+            if float(OmegaConf.select(config, "algorithm.copd.step_advantage_w") or 0.0) != 0.0 and not singleton_only:
+                raise ValueError(
+                    "Episode-level COPD OPD requires algorithm.copd.step_advantage_w=0.0; "
+                    "set algorithm.copd.singleton_only=True for SOPD with GiGPO step advantage."
+                )
             if str(OmegaConf.select(config, "algorithm.copd.selector")) != "llm":
                 raise ValueError("Episode-level COPD OPD requires algorithm.copd.selector=llm.")
         if teacher_advantage_w_start is not None and phase_switch_after_steps is not None:
@@ -1830,8 +1842,10 @@ class RayPPOTrainer:
         metrics["copd/episode_hint_guidance/enabled"] = 0.0
         configured_failed_only = bool(OmegaConf.select(self.config, "algorithm.copd.failed_only"))
         failed_only_after_steps = self._get_copd_failed_only_after_steps()
-        failed_only = self._should_copd_analyze_failed_only()
-        analysis_mode = "failed_episode_opd" if failed_only else "teacher_bootstrap"
+        scheduled_failed_only = self._should_copd_analyze_failed_only()
+        singleton_only = self._is_copd_singleton_only()
+        failed_only = False if singleton_only else scheduled_failed_only
+        analysis_mode = "singleton_opd" if singleton_only else ("failed_episode_opd" if failed_only else "teacher_bootstrap")
 
         module_logger.info(
             "Preparing COPD analysis for batch_size=%s, num_trajectories=%s, selector=%s, analysis_backend=%s, analysis_mode=%s, failed_only_after_steps=%s",
@@ -1842,8 +1856,12 @@ class RayPPOTrainer:
             analysis_mode,
             failed_only_after_steps,
         )
-        metrics["copd/analysis_mode_teacher_bootstrap"] = 0.0 if failed_only else 1.0
-        metrics["copd/analysis_mode_failed_episode_opd"] = 1.0 if failed_only else 0.0
+        metrics["copd/analysis_mode_teacher_bootstrap"] = 1.0 if not failed_only and not singleton_only else 0.0
+        metrics["copd/analysis_mode_failed_episode_opd"] = 1.0 if failed_only and not singleton_only else 0.0
+        metrics["sopd/enabled"] = 1.0 if singleton_only else 0.0
+        metrics["sopd/analysis_mode_singleton_opd"] = 1.0 if singleton_only and not failed_only else 0.0
+        metrics["sopd/analysis_mode_singleton_failed_episode_opd"] = 1.0 if singleton_only and failed_only else 0.0
+        metrics["sopd/failed_only_ignored"] = 1.0 if singleton_only and scheduled_failed_only else 0.0
 
         if "obs_text" not in batch.non_tensor_batch:
             module_logger.warning("COPD teacher signal skipped because obs_text is missing from the rollout batch.")
@@ -1875,6 +1893,54 @@ class RayPPOTrainer:
         critical_mask_np = np.zeros(batch_size, dtype=bool)
         base_obs_texts = batch.non_tensor_batch.get("obs_text_base", batch.non_tensor_batch["obs_text"])
         analysis_obs_texts = base_obs_texts
+        singleton_mask_np = np.ones(batch_size, dtype=bool)
+        if singleton_only:
+            if "anchor_obs" not in batch.non_tensor_batch or "uid" not in batch.non_tensor_batch:
+                module_logger.warning(
+                    "SOPD teacher signal skipped because anchor_obs or uid is missing from the rollout batch."
+                )
+                batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+                batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+                batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
+                batch.batch["critical_step_mask"] = zero_critical_mask
+                batch.batch["step_hint_mask"] = zero_step_hint_mask
+                batch.batch["teacher_signal_mask"] = zero_critical_mask
+                metrics["copd/critical_step_ratio"] = 0.0
+                metrics["copd/teacher_batch_size"] = 0.0
+                metrics["copd/teacher_available"] = 0.0
+                metrics["sopd/skipped_missing_state_group_inputs"] = 1.0
+                return batch
+
+            enable_similarity_config = OmegaConf.select(self.config, "algorithm.copd.enable_similarity")
+            if isinstance(enable_similarity_config, str):
+                enable_similarity = enable_similarity_config.lower() in ("1", "true", "yes", "on")
+            else:
+                enable_similarity = bool(enable_similarity_config)
+            singleton_mask_np, singleton_metrics = core_gigpo.compute_singleton_step_mask(
+                anchor_obs=batch.non_tensor_batch["anchor_obs"],
+                index=batch.non_tensor_batch["uid"],
+                enable_similarity=enable_similarity,
+                similarity_thresh=float(OmegaConf.select(self.config, "algorithm.copd.similarity_thresh") or 0.95),
+                metrics_prefix="copd/state_group",
+            )
+            metrics.update(singleton_metrics)
+            metrics["sopd/singleton_step_count"] = float(singleton_mask_np.sum())
+            metrics["sopd/singleton_step_ratio"] = (
+                float(singleton_mask_np.mean()) if singleton_mask_np.size > 0 else 0.0
+            )
+            if not singleton_mask_np.any():
+                module_logger.info("SOPD found no singleton state-group steps in the current batch.")
+                batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+                batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+                batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
+                batch.batch["critical_step_mask"] = zero_critical_mask
+                batch.batch["step_hint_mask"] = zero_step_hint_mask
+                batch.batch["teacher_signal_mask"] = zero_critical_mask
+                metrics["copd/critical_step_ratio"] = 0.0
+                metrics["copd/teacher_batch_size"] = 0.0
+                metrics["copd/teacher_available"] = 0.0
+                metrics["sopd/no_singleton_steps"] = 1.0
+                return batch
 
         episodes = core_copd.build_episode_records(
             tokenizer=self.tokenizer,
@@ -1914,10 +1980,42 @@ class RayPPOTrainer:
                 return True
             return success_value < 1.0
 
-        analyzed_traj_count = float(sum(1 for traj_uid in episodes if _should_analyze_traj(traj_uid)))
+        traj_to_singleton_step_indices: Dict[object, List[int]] = defaultdict(list)
+        if singleton_only:
+            for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
+                if singleton_mask_np[sample_idx]:
+                    traj_to_singleton_step_indices[sample_traj_uid].append(int(step_indices[sample_idx]))
+
+        def _has_analysis_candidates(traj_uid: object) -> bool:
+            return not singleton_only or bool(traj_to_singleton_step_indices.get(traj_uid))
+
+        analyzed_traj_count = float(
+            sum(
+                1
+                for traj_uid in episodes
+                if _should_analyze_traj(traj_uid) and _has_analysis_candidates(traj_uid)
+            )
+        )
         metrics["copd/analyzed_traj_count"] = analyzed_traj_count
         metrics["copd/failed_traj_count"] = analyzed_traj_count
-        metrics["copd/skipped_success_traj_count"] = float(max(len(episodes) - int(analyzed_traj_count), 0))
+        metrics["copd/skipped_success_traj_count"] = float(
+            sum(1 for traj_uid in episodes if not _should_analyze_traj(traj_uid))
+        )
+        metrics["sopd/candidate_step_count"] = float(
+            sum(len(step_indices_for_traj) for step_indices_for_traj in traj_to_singleton_step_indices.values())
+            if singleton_only
+            else batch_size
+        )
+        metrics["sopd/candidate_traj_count"] = float(
+            len(traj_to_singleton_step_indices) if singleton_only else len(episodes)
+        )
+        metrics["sopd/skipped_non_singleton_traj_count"] = float(
+            sum(
+                1
+                for traj_uid in episodes
+                if _should_analyze_traj(traj_uid) and not _has_analysis_candidates(traj_uid)
+            )
+        )
         if selector != "llm":
             raise ValueError("Episode-level COPD OPD requires algorithm.copd.selector=llm.")
 
@@ -1929,28 +2027,51 @@ class RayPPOTrainer:
         for traj_uid, steps in episodes.items():
             if not _should_analyze_traj(traj_uid):
                 continue
+            candidate_step_indices = [int(step["step_index"]) for step in steps]
+            if singleton_only:
+                candidate_step_indices = traj_to_singleton_step_indices.get(traj_uid, [])
+                if not candidate_step_indices:
+                    continue
             analysis_tasks[traj_uid] = {
                 "steps": steps,
-                "candidate_step_indices": [int(step["step_index"]) for step in steps],
+                "candidate_step_indices": candidate_step_indices,
                 "analysis_mode": analysis_mode,
                 "episode_success": traj_success.get(traj_uid),
             }
         analyzed, analysis_workers = self._analyze_copd_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
         episode_analysis.update(analyzed)
+
+        def _has_successful_analysis(traj_uid: object, analysis: Dict[str, object]) -> bool:
+            if analysis.get("analysis_error"):
+                return False
+            if not singleton_only:
+                return bool(str(analysis.get("episode_hint", "")).strip())
+
+            required_step_indices = set(traj_to_singleton_step_indices.get(traj_uid, []))
+            if not required_step_indices:
+                return False
+            hinted_step_indices = {
+                int(step_idx)
+                for step_idx, hint in analysis.get("step_hints", {}).items()
+                if str(hint).strip()
+            }
+            return required_step_indices.issubset(hinted_step_indices)
+
         successful_episode_analysis = {
             traj_uid: analysis
             for traj_uid, analysis in episode_analysis.items()
-            if not analysis.get("analysis_error") and str(analysis.get("episode_hint", "")).strip()
+            if _has_successful_analysis(traj_uid, analysis)
         }
         failed_analysis_count = len(episode_analysis) - len(successful_episode_analysis)
 
         critical_mask_np = np.zeros(batch_size, dtype=bool)
         analyzed_traj_uids = set(successful_episode_analysis.keys())
         for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
-            if sample_traj_uid in analyzed_traj_uids:
+            if sample_traj_uid in analyzed_traj_uids and (not singleton_only or singleton_mask_np[sample_idx]):
                 critical_mask_np[sample_idx] = True
         module_logger.info(
-            "COPD episode-level OPD selected %s steps from %s successful analyzed trajectories (%s failed/skipped).",
+            "%s selected %s steps from %s successful analyzed trajectories (%s failed/skipped).",
+            "SOPD singleton OPD" if singleton_only else "COPD episode-level OPD",
             int(critical_mask_np.sum()),
             len(analyzed_traj_uids),
             failed_analysis_count,
@@ -1981,6 +2102,10 @@ class RayPPOTrainer:
         batch.batch["critical_step_mask"] = critical_mask
 
         metrics["copd/critical_step_ratio"] = float(critical_mask_np.mean()) if batch_size > 0 else 0.0
+        metrics["sopd/opd_step_count"] = float(critical_mask_np.sum()) if singleton_only else 0.0
+        metrics["sopd/opd_step_ratio"] = (
+            float(critical_mask_np.mean()) if singleton_only and batch_size > 0 else 0.0
+        )
         metrics["copd/teacher_batch_size"] = float(len(critical_indices))
         metrics["copd/teacher_available"] = 1.0
         metrics["copd/step_hint_guidance/step_guided_step_ratio"] = 0.0

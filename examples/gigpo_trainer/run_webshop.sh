@@ -16,11 +16,11 @@ NUM_CPUS_PER_ENV_WORKER=0.1
 
 # GiGPO advantage.
 GIGPO_MODE=mean_norm
-GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-1.0}
+GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-gigpo_qwen2.5_3b_webshop}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_webshop}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -38,7 +38,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$TRAIN_DATA_SIZE \
     data.val_batch_size=$VAL_DATA_SIZE \
-    data.max_prompt_length=6000 \
+    data.max_prompt_length=4096 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation=left \

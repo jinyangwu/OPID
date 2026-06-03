@@ -74,6 +74,29 @@ def test_copd_prompt_for_failed_episode_emphasizes_avoidance():
     assert "Because this is a failed episode" not in user_prompt
 
 
+def test_sopd_prompt_treats_all_singleton_steps_as_key_candidates():
+    analyzer = COPDEpisodeAnalyzer(max_step_hints_per_traj=1)
+
+    prompt = analyzer._build_episode_analysis_prompt(
+        steps=_sample_steps(),
+        candidate_step_indices=[0, 1],
+        analysis_mode="singleton_opd",
+        episode_success=0.0,
+    )
+    user_prompt = prompt["messages"][0]["content"]
+
+    assert "SOPD (Singleton OPD)" in user_prompt
+    assert "Every candidate singleton step is treated as a key training step" in user_prompt
+    assert "Do not select a subset" in user_prompt
+    assert "reinforce the observed decision or correct it" in user_prompt
+    assert "exactly two top-level fields" in user_prompt
+    assert "every candidate singleton step index exactly once" in user_prompt
+    assert "Candidate singleton step indices: [0, 1]" in user_prompt
+    assert "correct on-policy decision" not in user_prompt
+    assert "episode_hint" not in user_prompt
+    assert "episode_success: failure" not in user_prompt
+
+
 def test_copd_parse_uses_episode_hint_and_step_hints():
     analyzer = COPDEpisodeAnalyzer()
 

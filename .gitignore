@@ -1,3 +1,7 @@
+gpu.sh
+ret.sh
+run.sh
+
 past
 **/*.pyc
 **/*.whl

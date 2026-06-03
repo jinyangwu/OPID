@@ -295,7 +295,7 @@ algorithm:
     enable_similarity: False
     similarity_thresh: 0.95
   copd:
-    step_advantage_w: 0.0
+    step_advantage_w: 0.0 # SOPD may set this >0 to keep GiGPO step advantage.
     teacher_advantage_w: 1.0
     episode_hint_teacher_advantage_w: null
     step_hint_teacher_advantage_w: 0.0
@@ -307,6 +307,7 @@ algorithm:
     enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
     similarity_thresh: 0.95
+    singleton_only: False # SOPD: apply OPD teacher signal only to state groups of size 1
     selector: "llm"
     failed_only: False # if True, analyze and apply teacher OPD only on failed episodes
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only

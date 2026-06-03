@@ -288,6 +288,7 @@ class COPDEpisodeAnalyzer:
             if candidate_step_indices is None
             else [int(idx) for idx in candidate_step_indices]
         )
+        singleton_mode = self._is_singleton_analysis_mode(analysis_mode)
         prompt = self._build_episode_analysis_prompt(
             steps=steps,
             candidate_step_indices=candidate_list,
@@ -327,6 +328,15 @@ class COPDEpisodeAnalyzer:
                     exc,
                 )
                 continue
+            if not singleton_mode and not str(parsed.get("episode_hint", "")).strip():
+                last_error = ValueError("COPD analyzer response missing required field: episode_hint")
+                logger.warning(
+                    "COPD analyzer JSON parse failed on attempt %s/%s: %s",
+                    parse_attempt + 1,
+                    parse_attempts,
+                    last_error,
+                )
+                continue
 
             candidate_step_set = set(candidate_list)
             filtered_step_hints = {
@@ -334,9 +344,28 @@ class COPDEpisodeAnalyzer:
                 for step_idx, hint in parsed.get("step_hints", {}).items()
                 if step_idx in candidate_step_set
             }
-            parsed["step_hints"] = dict(
-                list(filtered_step_hints.items())[: self.max_step_hints_per_traj]
-            )
+            if singleton_mode:
+                missing_step_indices = [step_idx for step_idx in candidate_list if step_idx not in filtered_step_hints]
+                if missing_step_indices:
+                    last_error = ValueError(
+                        "SOPD analyzer response missing step_hints for singleton candidate "
+                        f"steps: {missing_step_indices}"
+                    )
+                    logger.warning(
+                        "SOPD analyzer JSON parse failed on attempt %s/%s: %s",
+                        parse_attempt + 1,
+                        parse_attempts,
+                        last_error,
+                    )
+                    continue
+                parsed["step_hints"] = {
+                    step_idx: filtered_step_hints[step_idx]
+                    for step_idx in candidate_list
+                }
+            else:
+                parsed["step_hints"] = dict(
+                    list(filtered_step_hints.items())[: self.max_step_hints_per_traj]
+                )
             parsed["analysis_backend_requested"] = self.requested_backend
             parsed["analysis_backend_used"] = "openai"
             parsed["analysis_error"] = None
@@ -372,6 +401,10 @@ class COPDEpisodeAnalyzer:
             logger.warning("Invalid COPD_ANALYSIS_PARSE_RETRIES=%r; using 2.", raw_attempts)
             return 2
 
+    @staticmethod
+    def _is_singleton_analysis_mode(analysis_mode: str) -> bool:
+        return str(analysis_mode or "").startswith("singleton")
+
     def _build_json_retry_prompt(
         self,
         original_prompt: Dict[str, Any],
@@ -385,6 +418,23 @@ class COPDEpisodeAnalyzer:
                 original_user_prompt = str(message.get("content", ""))
                 break
         invalid_preview = str(invalid_response or "")[-2000:]
+        singleton_retry = "SOPD (Singleton OPD)" in original_user_prompt
+        if singleton_retry:
+            schema_text = """{
+  "episode_summary": "string",
+  "step_hints": {}
+}"""
+            extra_instruction = (
+                "For SOPD/singleton analysis, every candidate singleton step "
+                "from the original prompt must appear in step_hints."
+            )
+        else:
+            schema_text = """{
+  "episode_summary": "string",
+  "episode_hint": "string",
+  "step_hints": {}
+}"""
+            extra_instruction = ""
         retry_prompt = f"""{original_user_prompt}
 
 The previous answer could not be parsed as the required JSON object.
@@ -394,11 +444,9 @@ Previous answer:
 {invalid_preview}
 
 Return ONLY one valid JSON object with this exact shape:
-{{
-  "episode_summary": "string",
-  "episode_hint": "string",
-  "step_hints": {{}}
-}}
+{schema_text}
+
+{extra_instruction}
 """
         return build_prompt_dict(user_prompt=retry_prompt)
 
@@ -423,6 +471,13 @@ Return ONLY one valid JSON object with this exact shape:
         episode_success: Optional[float] = None,
         task_description: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._is_singleton_analysis_mode(analysis_mode):
+            return self._build_singleton_opd_analysis_prompt(
+                steps=steps,
+                candidate_step_indices=candidate_step_indices,
+                task_description=task_description,
+            )
+
         task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
         max_hint_count = min(self.max_step_hints_per_traj, len(candidate_step_indices))
 
@@ -491,10 +546,156 @@ Episode context:
 """
         return build_prompt_dict(user_prompt=prompt_text)
 
+    def _build_singleton_opd_analysis_prompt(
+        self,
+        steps: List[Dict[str, object]],
+        candidate_step_indices: Sequence[int],
+        task_description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
+        candidate_list = [int(idx) for idx in candidate_step_indices]
+        prompt_text = f"""
+You are producing SOPD (Singleton OPD) guidance for an on-policy agent trajectory.
+
+SOPD assumption:
+- Every candidate singleton step is treated as a key training step.
+- Do not select a subset. Produce guidance for every candidate singleton step.
+- The guidance may reinforce the observed decision or correct it, depending on the full trajectory context.
+
+Your output must contain exactly two top-level fields:
+1. "episode_summary"
+2. "step_hints"
+
+# Task requirements
+- Write a concise episode_summary describing what the trajectory did.
+- For every candidate singleton step, write exactly one short action-oriented step hint for what the policy should do at that key step.
+
+# Rules for step_hints
+- Step indices are 0-based.
+- The "step_hints" object must contain every candidate singleton step index exactly once.
+- The only allowed step_hints keys are: {candidate_list}
+- Do not omit any candidate singleton step.
+- Each hint must be a single short imperative sentence the policy can act on at that step.
+- Write policy-facing guidance, not retrospective narration.
+
+# Style requirements
+- Keep episode_summary concise and factual.
+- Keep each step hint specific, actionable, and brief.
+- Do not output markdown, code fences, or any text outside the JSON object.
+
+# Output schema
+{{
+  "episode_summary": "string",
+  "step_hints": {{
+    "0": "short key-step hint for step 0",
+    "2": "short key-step hint for step 2"
+  }}
+}}
+
+Episode context:
+- Task description: {task_description or "(not available)"}
+- Candidate singleton step indices: {candidate_list}
+- Interaction trajectory: {self._format_episode_steps(steps)}
+
+Return only valid JSON.
+"""
+        return build_prompt_dict(user_prompt=prompt_text)
+
+    def _build_episode_analysis_prompt_v1(
+        self,
+        steps: List[Dict[str, object]],
+        candidate_step_indices: Sequence[int],
+        analysis_mode: str = "teacher_bootstrap",
+        episode_success: Optional[float] = None,
+        task_description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
+        max_hint_count = min(self.max_step_hints_per_traj, len(candidate_step_indices))
+
+        outcome_label = "unknown"
+        if episode_success is not None:
+            try:
+                outcome_label = "success" if float(episode_success) >= 1.0 else "failure"
+            except (TypeError, ValueError):
+                outcome_label = "unknown"
+
+        if outcome_label == "success":
+            episode_hint_instruction = (
+                "Write exactly one episode_hint that distills the successful trajectory into a reusable workflow: "
+                "capture the key decision rule, ordering of actions, and what made the trajectory effective. "
+                # "Phrase it as a general skill pattern, not as instructions for this exact task."
+            )
+        elif outcome_label == "failure":
+            episode_hint_instruction = (
+                "Write exactly one episode_hint that distills the failed trajectory into reusable avoidance guidance: "
+                "identify the main decision error, unhelpful action pattern, or failure mode the policy should avoid. "
+                # "Phrase it as a general avoidance skill pattern, not as a one-off lesson tied to this exact task."
+            )
+        else:
+            episode_hint_instruction = (
+                "Write exactly one episode_hint distilled from the trajectory. "
+                "If the trajectory appears successful, summarize the reusable workflow; "
+                "if it appears unsuccessful, summarize the main avoidance rule. "
+            )
+
+        summary_instruction = "Write a concise summary for the trajectory."
+        selection_instruction = (
+            f"Provide concise, action-oriented decision guidance for at most {max_hint_count} critical step(s) "
+            "from the candidate set as entries in step_hints; use the full episode to infer the guidance, "
+            "but phrase each hint as advice the policy can act on at that step."
+        )
+        prompt_text = f"""
+You are analyzing an agent trajectory to produce training guidance for the policy.
+
+Your output must contain exactly three top-level fields:
+1. "episode_summary"
+2. "episode_hint"
+3. "step_hints"
+
+# Task requirements
+- Write a concise episode_summary describing the trajectory, major turning points, and outcome.
+- {episode_hint_instruction}
+- Select at most {max_hint_count} critical steps from the candidate set and provide one short action-oriented hint for each selected step in "step_hints".
+
+# Rules for episode_hint
+- Make it a reusable policy-level lesson, not a summary of this episode.
+
+# Rules for step_hints
+- Step indices are 0-based.
+- You must choose steps from this candidate set: {list(candidate_step_indices)}.
+- The keys in "step_hints" must be exactly the selected step indices, represented as strings.
+- It is acceptable to return fewer than {max_hint_count} hints if fewer steps are truly critical.
+- Each hint must be a single short imperative sentence that the policy could act on at that step.
+- Write policy-facing guidance, not retrospective narration.
+
+# Style requirements
+- Keep episode_summary concise and factual.
+- Keep episode_hint generalizable across similar tasks.
+- Keep each step hint specific, actionable, and brief.
+- Do not output markdown, code fences, or any text outside the JSON object.
+
+# Output schema
+{{
+  "episode_summary": "string",
+  "episode_hint": "string",
+  "step_hints": {{
+    "0": "short imperative hint",
+    "2": "short imperative hint"
+  }}
+}}
+
+Episode context:
+- Task description: {task_description or "(not available)"}
+- episode_success: {outcome_label}
+- Candidate step indices: {list(candidate_step_indices)}
+- Interaction trajectory: {self._format_episode_steps(steps)}
+
+Return only valid JSON.
+"""
+        return build_prompt_dict(user_prompt=prompt_text)
+    
     def _parse_analysis_response(self, response: str) -> Dict[str, object]:
         parsed = self._extract_json_object(response)
-        if "episode_hint" not in parsed:
-            raise ValueError("COPD analyzer response missing required field: episode_hint")
         step_hints_raw = parsed.get("step_hints", {}) or {}
         step_hints = {}
         if isinstance(step_hints_raw, dict):
@@ -505,7 +706,7 @@ Episode context:
                     continue
         return {
             "episode_summary": str(parsed.get("episode_summary", "")),
-            "episode_hint": str(parsed["episode_hint"]),
+            "episode_hint": str(parsed.get("episode_hint", "")),
             "step_hints": step_hints,
         }
 

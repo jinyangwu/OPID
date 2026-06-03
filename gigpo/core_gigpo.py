@@ -139,6 +139,42 @@ def compute_step_group_distribution_metrics(step_group_uids: Sequence, prefix: s
     return compute_group_size_distribution_metrics(group_counts.values(), prefix=prefix)
 
 
+def compute_singleton_step_mask(
+    anchor_obs: np.ndarray,
+    index: np.ndarray,
+    enable_similarity: bool = False,
+    similarity_thresh: float = 0.95,
+    metrics_prefix: str = "copd/state_group",
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Return a mask for steps whose state group has exactly one sample."""
+    if len(anchor_obs) == 0:
+        metrics = compute_group_size_distribution_metrics([], prefix=metrics_prefix)
+        metrics[f"{metrics_prefix}/singleton_group_count"] = 0.0
+        metrics[f"{metrics_prefix}/singleton_sample_count"] = 0.0
+        metrics[f"{metrics_prefix}/singleton_sample_prop"] = 0.0
+        metrics[f"{metrics_prefix}/raw_group_sizes"] = []
+        return np.zeros(0, dtype=bool), metrics
+
+    step_group_uids = build_step_group(
+        anchor_obs=anchor_obs,
+        index=index,
+        enable_similarity=enable_similarity,
+        similarity_thresh=similarity_thresh,
+    )
+    group_counts = Counter(step_group_uids.tolist() if isinstance(step_group_uids, np.ndarray) else list(step_group_uids))
+    singleton_mask = np.asarray([group_counts[group_uid] == 1 for group_uid in step_group_uids], dtype=bool)
+
+    metrics = compute_group_size_distribution_metrics(group_counts.values(), prefix=metrics_prefix)
+    singleton_group_count = sum(1 for size in group_counts.values() if size == 1)
+    metrics[f"{metrics_prefix}/singleton_group_count"] = float(singleton_group_count)
+    metrics[f"{metrics_prefix}/singleton_sample_count"] = float(singleton_mask.sum())
+    metrics[f"{metrics_prefix}/singleton_sample_prop"] = (
+        float(singleton_mask.mean()) if singleton_mask.size > 0 else 0.0
+    )
+    metrics[f"{metrics_prefix}/raw_group_sizes"] = [int(size) for size in group_counts.values()]
+    return singleton_mask, metrics
+
+
 def are_similar(a: str, b: str, threshold: float = 0.95) -> bool:
     """
     Check whether two text observations are similar enough.
@@ -426,10 +462,6 @@ def compute_copd_advantage_components(
     """
     Compute episode-level COPD advantages plus an optional episode-level teacher term.
     """
-    if float(step_advantage_w) != 0.0:
-        raise ValueError("COPD now uses episode-level advantage only; set algorithm.copd.step_advantage_w=0.0.")
-    del step_rewards, anchor_obs, enable_similarity, similarity_thresh, metrics_prefix
-
     remove_std = _mode_to_remove_std(mode)
 
     episode_advantages = episode_norm_reward(
@@ -441,8 +473,19 @@ def compute_copd_advantage_components(
         remove_std=remove_std,
     )
 
-    step_advantages = torch.zeros_like(episode_advantages)
-    step_group_metrics: Dict[str, float] = {}
+    step_weight = float(step_advantage_w or 0.0)
+    if step_weight != 0.0:
+        if step_rewards is None:
+            raise ValueError("step_rewards is required when algorithm.copd.step_advantage_w is non-zero.")
+        step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
+        step_group_metrics = compute_step_group_distribution_metrics(
+            step_group_uids=step_group_uids,
+            prefix=metrics_prefix,
+        )
+        step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
+    else:
+        step_advantages = torch.zeros_like(episode_advantages)
+        step_group_metrics: Dict[str, float] = {}
     episode_hint_weight = (
         float(teacher_advantage_w)
         if episode_hint_teacher_advantage_w is None
@@ -475,9 +518,11 @@ def compute_copd_advantage_components(
 
     scores = (
         episode_advantages
+        + step_weight * step_advantages
         + teacher_advantages
     )
     step_group_metrics.update({
+        "copd/adv/step_advantage_weight": step_weight,
         "copd/adv/episode_hint_teacher_weight": episode_hint_weight,
         "copd/adv/step_hint_teacher_weight": step_hint_weight,
     })
