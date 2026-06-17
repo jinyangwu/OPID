@@ -14,12 +14,12 @@ VAL_DATA_SIZE=128
 GROUP_SIZE=8
 NUM_CPUS_PER_ENV_WORKER=0.1
 
-# SOPD advantage, teacher/OPD signal schedule, and phase control.
+# SOPD advantage and teacher/OPD signal schedule.
 SOPD_MODE=mean_norm
 SOPD_STEP_ADV_W=${SOPD_STEP_ADV_W:-1.0}
 SOPD_STEP_HINT_TEACHER_ADV_W=${SOPD_STEP_HINT_TEACHER_ADV_W:-0.001}
 SOPD_OPD_START_AFTER_STEPS=${SOPD_OPD_START_AFTER_STEPS:-null}
-SOPD_PHASE_SWITCH_AFTER_STEPS=${SOPD_PHASE_SWITCH_AFTER_STEPS:-null}
+SOPD_OPD_STOP_AFTER_STEPS=${SOPD_OPD_STOP_AFTER_STEPS:-null}
 
 # SOPD singleton grouping and analysis.
 SOPD_ENABLE_ANALYSIS=${SOPD_ENABLE_ANALYSIS:-True}
@@ -85,11 +85,10 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gamma=0.95 \
     algorithm.copd.singleton_only=True \
     algorithm.copd.step_advantage_w=$SOPD_STEP_ADV_W \
-    algorithm.copd.teacher_advantage_w=0.0 \
     algorithm.copd.episode_hint_teacher_advantage_w=0.0 \
     algorithm.copd.step_hint_teacher_advantage_w=$SOPD_STEP_HINT_TEACHER_ADV_W \
     algorithm.copd.opd_start_after_steps=$SOPD_OPD_START_AFTER_STEPS \
-    algorithm.copd.phase_switch_after_steps=$SOPD_PHASE_SWITCH_AFTER_STEPS \
+    algorithm.copd.opd_stop_after_steps=$SOPD_OPD_STOP_AFTER_STEPS \
     algorithm.copd.failed_only=False \
     algorithm.copd.failed_only_after_steps=null \
     algorithm.copd.mode=$SOPD_MODE \

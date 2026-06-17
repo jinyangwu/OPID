@@ -49,6 +49,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_subtask_success_rate_mean,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -65,7 +66,11 @@ from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 from gigpo import copd as core_copd
 
-from agent_system.memory.episode_hint import build_augmented_observation_text
+from agent_system.memory.episode_hint import (
+    HINT_TEACHER_MODES,
+    build_augmented_observation_text,
+    select_hint_teacher_sources,
+)
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -260,8 +265,7 @@ def compute_advantage(
     gigpo_mode="mean_std_norm",
     gigpo_enable_similarity=False,
     gigpo_similarity_thresh=0.95,
-    teacher_advantage_w=1.0,
-    episode_hint_teacher_advantage_w=None,
+    episode_hint_teacher_advantage_w=1.0,
     step_hint_teacher_advantage_w=0.0,
     copd_mode="mean_norm",
     copd_enable_similarity=False,
@@ -429,7 +433,6 @@ def compute_advantage(
             critical_step_mask=critical_step_mask,
             step_hint_mask=step_hint_mask,
             step_advantage_w=step_advantage_w,
-            teacher_advantage_w=teacher_advantage_w,
             episode_hint_teacher_advantage_w=episode_hint_teacher_advantage_w,
             step_hint_teacher_advantage_w=step_hint_teacher_advantage_w,
             mode=copd_mode,
@@ -507,7 +510,6 @@ class RayPPOTrainer:
         self.val_envs = val_envs
         self._copd_analyzer = None
         self._copd_teacher_adv_last_enabled_state = None
-        self._copd_teacher_adv_last_weight = None
         self._copd_failed_only_last_enabled_state = None
         self._copd_analysis_last_enabled_state = None
         self._copd_teacher_signal_executor = None
@@ -554,11 +556,11 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-    def _get_copd_phase_switch_after_steps(self) -> Optional[int]:
-        phase_switch_after_steps = OmegaConf.select(self.config, "algorithm.copd.phase_switch_after_steps")
-        if phase_switch_after_steps is None:
+    def _get_copd_opd_stop_after_steps(self) -> Optional[int]:
+        stop_after_steps = OmegaConf.select(self.config, "algorithm.copd.opd_stop_after_steps")
+        if stop_after_steps is None:
             return None
-        return int(phase_switch_after_steps)
+        return int(stop_after_steps)
 
     def _get_copd_opd_start_after_steps(self) -> Optional[int]:
         start_after_steps = OmegaConf.select(self.config, "algorithm.copd.opd_start_after_steps")
@@ -594,39 +596,6 @@ class RayPPOTrainer:
             self._copd_failed_only_last_enabled_state = enabled
         return enabled
 
-    def _get_copd_teacher_advantage_weight(self, teacher_enabled: bool) -> float:
-        if not teacher_enabled:
-            return 0.0
-
-        target_weight = float(OmegaConf.select(self.config, "algorithm.copd.teacher_advantage_w") or 0.0)
-        start_weight = OmegaConf.select(self.config, "algorithm.copd.teacher_advantage_w_start")
-        if start_weight is None:
-            weight = target_weight
-        else:
-            start_weight = float(start_weight)
-            ramp_steps = OmegaConf.select(self.config, "algorithm.copd.teacher_advantage_w_ramp_steps")
-            start_after_steps = self._get_copd_opd_start_after_steps() or 0
-            if ramp_steps is None:
-                ramp_steps = max(int(self.total_training_steps) - start_after_steps, 1)
-            else:
-                ramp_steps = int(ramp_steps)
-
-            if ramp_steps <= 1:
-                weight = target_weight
-            else:
-                teacher_enabled_step = self.global_steps - start_after_steps
-                progress = min(max(teacher_enabled_step - 1, 0), ramp_steps - 1) / float(ramp_steps - 1)
-                weight = start_weight + (target_weight - start_weight) * progress
-
-        if self._copd_teacher_adv_last_weight is None or abs(self._copd_teacher_adv_last_weight - weight) > 1e-8:
-            module_logger.info(
-                "COPD teacher advantage weight is %.6f at global_step=%s.",
-                weight,
-                self.global_steps,
-            )
-            self._copd_teacher_adv_last_weight = weight
-        return weight
-
     def _is_copd_analysis_enabled(self) -> bool:
         configured = OmegaConf.select(self.config, "algorithm.copd.enable_analysis")
         if configured is None:
@@ -655,24 +624,24 @@ class RayPPOTrainer:
 
     def _is_copd_teacher_adv_enabled(self) -> bool:
         start_after_steps = self._get_copd_opd_start_after_steps()
-        phase_switch_after_steps = self._get_copd_phase_switch_after_steps()
+        stop_after_steps = self._get_copd_opd_stop_after_steps()
 
         enabled = True
         disabled_reason = None
         if start_after_steps is not None and self.global_steps <= start_after_steps:
             enabled = False
             disabled_reason = "before_start"
-        elif phase_switch_after_steps is not None and self.global_steps > phase_switch_after_steps:
+        elif stop_after_steps is not None and self.global_steps > stop_after_steps:
             enabled = False
-            disabled_reason = "after_phase_switch"
+            disabled_reason = "after_stop"
 
         if self._copd_teacher_adv_last_enabled_state != enabled:
             if enabled:
                 schedule_parts = []
                 if start_after_steps is not None:
                     schedule_parts.append(f"after step {start_after_steps}")
-                if phase_switch_after_steps is not None:
-                    schedule_parts.append(f"until step {phase_switch_after_steps}")
+                if stop_after_steps is not None:
+                    schedule_parts.append(f"until step {stop_after_steps}")
                 schedule_text = f" ({', '.join(schedule_parts)})" if schedule_parts else ""
                 module_logger.info(
                     "COPD teacher advantage is enabled at global_step=%s%s.",
@@ -687,9 +656,9 @@ class RayPPOTrainer:
                 )
             else:
                 module_logger.info(
-                    "COPD teacher advantage is disabled at global_step=%s because phase_switch_after_steps=%s.",
+                    "COPD teacher advantage is disabled at global_step=%s because opd_stop_after_steps=%s.",
                     self.global_steps,
-                    phase_switch_after_steps,
+                    stop_after_steps,
                 )
             self._copd_teacher_adv_last_enabled_state = enabled
         return enabled
@@ -823,7 +792,7 @@ class RayPPOTrainer:
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        phase_switch_after_steps = OmegaConf.select(config, "algorithm.copd.phase_switch_after_steps")
+        opd_stop_after_steps = OmegaConf.select(config, "algorithm.copd.opd_stop_after_steps")
         opd_start_after_steps = OmegaConf.select(config, "algorithm.copd.opd_start_after_steps")
         legacy_teacher_advantage_start_after_steps = OmegaConf.select(
             config,
@@ -838,8 +807,8 @@ class RayPPOTrainer:
                 legacy_teacher_advantage_start_after_steps,
             )
         failed_only_after_steps = OmegaConf.select(config, "algorithm.copd.failed_only_after_steps")
-        if phase_switch_after_steps is not None and int(phase_switch_after_steps) < 0:
-            raise ValueError("algorithm.copd.phase_switch_after_steps must be null or a non-negative integer.")
+        if opd_stop_after_steps is not None and int(opd_stop_after_steps) < 0:
+            raise ValueError("algorithm.copd.opd_stop_after_steps must be null or a non-negative integer.")
         if opd_start_after_steps is not None and int(opd_start_after_steps) < 0:
             raise ValueError("algorithm.copd.opd_start_after_steps must be null or a non-negative integer.")
         if failed_only_after_steps is not None and int(failed_only_after_steps) < 0:
@@ -849,27 +818,21 @@ class RayPPOTrainer:
                 "algorithm.copd.failed_only_after_steps=%s is set, so scheduled all-then-failed analysis overrides algorithm.copd.failed_only=True until after that step.",
                 failed_only_after_steps,
             )
-        teacher_advantage_w = float(OmegaConf.select(config, "algorithm.copd.teacher_advantage_w") or 0.0)
-        episode_hint_teacher_advantage_w = OmegaConf.select(config, "algorithm.copd.episode_hint_teacher_advantage_w")
+        episode_hint_teacher_advantage_w = float(
+            OmegaConf.select(config, "algorithm.copd.episode_hint_teacher_advantage_w") or 0.0
+        )
         step_hint_teacher_advantage_w = float(
             OmegaConf.select(config, "algorithm.copd.step_hint_teacher_advantage_w") or 0.0
         )
-        teacher_advantage_w_start = OmegaConf.select(config, "algorithm.copd.teacher_advantage_w_start")
-        teacher_advantage_w_ramp_steps = OmegaConf.select(config, "algorithm.copd.teacher_advantage_w_ramp_steps")
-        if teacher_advantage_w < 0:
-            raise ValueError("algorithm.copd.teacher_advantage_w must be non-negative.")
-        if episode_hint_teacher_advantage_w is not None and float(episode_hint_teacher_advantage_w) < 0:
-            raise ValueError("algorithm.copd.episode_hint_teacher_advantage_w must be null or a non-negative number.")
+        hint_teacher_mode = str(OmegaConf.select(config, "algorithm.copd.hint_teacher_mode") or "step_priority")
+        if episode_hint_teacher_advantage_w < 0:
+            raise ValueError("algorithm.copd.episode_hint_teacher_advantage_w must be non-negative.")
         if step_hint_teacher_advantage_w < 0:
             raise ValueError("algorithm.copd.step_hint_teacher_advantage_w must be non-negative.")
-        if teacher_advantage_w_start is not None and float(teacher_advantage_w_start) < 0:
-            raise ValueError("algorithm.copd.teacher_advantage_w_start must be null or a non-negative number.")
-        if teacher_advantage_w_start is None and teacher_advantage_w_ramp_steps is not None:
-            module_logger.warning(
-                "algorithm.copd.teacher_advantage_w_ramp_steps is set but algorithm.copd.teacher_advantage_w_start is null, so teacher_advantage_w will stay constant."
+        if hint_teacher_mode not in HINT_TEACHER_MODES:
+            raise ValueError(
+                f"algorithm.copd.hint_teacher_mode must be one of {HINT_TEACHER_MODES}, got {hint_teacher_mode!r}."
             )
-        if teacher_advantage_w_ramp_steps is not None and int(teacher_advantage_w_ramp_steps) <= 0:
-            raise ValueError("algorithm.copd.teacher_advantage_w_ramp_steps must be null or a positive integer.")
         if config.algorithm.adv_estimator == AdvantageEstimator.COPD or str(config.algorithm.adv_estimator) == AdvantageEstimator.COPD.value:
             singleton_only = self._is_copd_singleton_only()
             if float(OmegaConf.select(config, "algorithm.copd.step_advantage_w") or 0.0) != 0.0 and not singleton_only:
@@ -879,27 +842,12 @@ class RayPPOTrainer:
                 )
             if str(OmegaConf.select(config, "algorithm.copd.selector")) != "llm":
                 raise ValueError("Episode-level COPD OPD requires algorithm.copd.selector=llm.")
-        if teacher_advantage_w_start is not None and phase_switch_after_steps is not None:
-            teacher_start_after_steps = int(opd_start_after_steps or 0)
-            teacher_enabled_steps_before_phase_switch = int(phase_switch_after_steps) - teacher_start_after_steps
-            if teacher_enabled_steps_before_phase_switch <= 0:
+        if opd_start_after_steps is not None and opd_stop_after_steps is not None:
+            if int(opd_start_after_steps) >= int(opd_stop_after_steps):
                 module_logger.warning(
-                    "algorithm.copd.teacher_advantage_w_start is set, but teacher advantage is never enabled because opd_start_after_steps=%s and phase_switch_after_steps=%s. The teacher weight ramp will therefore never take effect.",
-                    teacher_start_after_steps,
-                    phase_switch_after_steps,
-                )
-            elif teacher_advantage_w_ramp_steps is not None and teacher_enabled_steps_before_phase_switch < int(teacher_advantage_w_ramp_steps):
-                module_logger.warning(
-                    "algorithm.copd.teacher_advantage_w_ramp_steps=%s is longer than the teacher-enabled phase (%s steps). The teacher weight ramp will stop early at the phase switch.",
-                    teacher_advantage_w_ramp_steps,
-                    teacher_enabled_steps_before_phase_switch,
-                )
-        elif opd_start_after_steps is not None and phase_switch_after_steps is not None:
-            if int(opd_start_after_steps) >= int(phase_switch_after_steps):
-                module_logger.warning(
-                    "algorithm.copd.opd_start_after_steps=%s is not earlier than phase_switch_after_steps=%s, so teacher advantage will never be enabled.",
+                    "algorithm.copd.opd_start_after_steps=%s is not earlier than opd_stop_after_steps=%s, so teacher advantage will never be enabled.",
                     opd_start_after_steps,
-                    phase_switch_after_steps,
+                    opd_stop_after_steps,
                 )
 
         # 1. Check total batch size for data correctness
@@ -1608,6 +1556,10 @@ class RayPPOTrainer:
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
 
+        subtask_success_rate_mean = compute_subtask_success_rate_mean(success_rate)
+        if subtask_success_rate_mean is not None:
+            metric_dict['val/subtask_success_rate_mean'] = subtask_success_rate_mean
+
         return metric_dict
 
     def init_workers(self):
@@ -2126,16 +2078,16 @@ class RayPPOTrainer:
             metrics["copd/teacher_batch_size"] = 0.0
             metrics["copd/teacher_available"] = 0.0
             teacher_start_after_steps = self._get_copd_opd_start_after_steps()
-            phase_switch_after_steps = self._get_copd_phase_switch_after_steps()
+            teacher_stop_after_steps = self._get_copd_opd_stop_after_steps()
             metrics["copd/teacher_skipped_by_schedule"] = 1.0
             metrics["copd/teacher_skipped_before_start"] = (
                 1.0
                 if teacher_start_after_steps is not None and self.global_steps <= teacher_start_after_steps
                 else 0.0
             )
-            metrics["copd/teacher_skipped_after_phase_switch"] = (
+            metrics["copd/teacher_skipped_after_opd_stop"] = (
                 1.0
-                if phase_switch_after_steps is not None and self.global_steps > phase_switch_after_steps
+                if teacher_stop_after_steps is not None and self.global_steps > teacher_stop_after_steps
                 else 0.0
             )
             return batch
@@ -2169,23 +2121,21 @@ class RayPPOTrainer:
         augmented_observation_dump_entries: List[Dict[str, object]] = []
         critical_preview = []
         step_hint_guided_steps = 0
-        episode_hint_teacher_advantage_w = OmegaConf.select(
-            self.config,
-            "algorithm.copd.episode_hint_teacher_advantage_w",
-        )
-        episode_hint_teacher_weight = (
-            self._get_copd_teacher_advantage_weight(teacher_enabled=True)
-            if episode_hint_teacher_advantage_w is None
-            else float(episode_hint_teacher_advantage_w)
+        episode_hint_teacher_weight = float(
+            OmegaConf.select(self.config, "algorithm.copd.episode_hint_teacher_advantage_w") or 0.0
         )
         episode_hint_teacher_enabled = episode_hint_teacher_weight > 0.0
         step_hint_teacher_enabled = (
             float(OmegaConf.select(self.config, "algorithm.copd.step_hint_teacher_advantage_w") or 0.0) > 0.0
         )
+        hint_teacher_mode = str(
+            OmegaConf.select(self.config, "algorithm.copd.hint_teacher_mode") or "step_priority"
+        )
         metrics["copd/episode_hint_guidance/enabled"] = 1.0 if episode_hint_teacher_enabled else 0.0
         metrics["copd/episode_hint_teacher_skipped_zero_weight"] = (
             0.0 if episode_hint_teacher_enabled else 1.0
         )
+        metrics["copd/hint_teacher_mode_additive"] = 1.0 if hint_teacher_mode == "additive" else 0.0
 
         for sample_idx in critical_indices:
             traj_uid = batch.non_tensor_batch["traj_uid"][sample_idx]
@@ -2202,7 +2152,21 @@ class RayPPOTrainer:
             )
             step_enhanced_obs = ""
             episode_enhanced_obs = ""
-            if step_hint.strip() and step_hint_teacher_enabled:
+            use_episode_hint, use_step_hint = select_hint_teacher_sources(
+                step_hint=step_hint,
+                episode_hint_enabled=episode_hint_teacher_enabled,
+                step_hint_enabled=step_hint_teacher_enabled,
+                mode=hint_teacher_mode,
+            )
+            if use_episode_hint:
+                episode_enhanced_obs = build_augmented_observation_text(
+                    observation=observation_text,
+                    episode_hint=episode_hint,
+                )
+                episode_obs_texts.append(episode_enhanced_obs)
+                episode_data_sources.append(data_source)
+                episode_hint_indices.append(int(sample_idx))
+            if use_step_hint:
                 step_hint_guided_steps += 1
                 step_enhanced_obs = build_augmented_observation_text(
                     observation=observation_text,
@@ -2211,14 +2175,6 @@ class RayPPOTrainer:
                 step_obs_texts.append(step_enhanced_obs)
                 step_data_sources.append(data_source)
                 step_hint_indices.append(int(sample_idx))
-            elif episode_hint_teacher_enabled:
-                episode_enhanced_obs = build_augmented_observation_text(
-                    observation=observation_text,
-                    episode_hint=episode_hint,
-                )
-                episode_obs_texts.append(episode_enhanced_obs)
-                episode_data_sources.append(data_source)
-                episode_hint_indices.append(int(sample_idx))
             augmented_observation_dump_entries.append(
                 {
                     "global_step": int(self.global_steps),
@@ -2227,7 +2183,7 @@ class RayPPOTrainer:
                     "step_idx": step_idx,
                     "analysis_mode": analysis.get("analysis_mode"),
                     "observation": observation_text,
-                    "augmented_observation": episode_enhanced_obs or step_enhanced_obs,
+                    "augmented_observation": step_enhanced_obs or episode_enhanced_obs,
                     "episode_augmented_observation": episode_enhanced_obs,
                     "step_augmented_observation": step_enhanced_obs,
                     "episode_summary": episode_summary,
@@ -2390,7 +2346,7 @@ class RayPPOTrainer:
 
         if episode_hint_indices:
             module_logger.info(
-                "COPD computed episode-hint teacher log-probs for %s non-step-hint steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
+                "COPD computed episode-hint teacher log-probs for %s steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
                 len(episode_hint_indices),
                 float(episode_teacher_lp.mean().detach().cpu().item()),
                 float(episode_teacher_lp.min().detach().cpu().item()),
@@ -2767,32 +2723,20 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
                         if self.config.algorithm.adv_estimator == AdvantageEstimator.COPD:
-                            copd_teacher_advantage_w = self._get_copd_teacher_advantage_weight(
-                                teacher_enabled=copd_teacher_adv_enabled
+                            episode_hint_teacher_advantage_w = (
+                                float(OmegaConf.select(self.config, "algorithm.copd.episode_hint_teacher_advantage_w") or 0.0)
+                                if copd_teacher_adv_enabled
+                                else 0.0
                             )
-                            metrics["copd/teacher_advantage_w_current"] = float(copd_teacher_advantage_w)
-                            episode_hint_teacher_advantage_w = OmegaConf.select(
-                                self.config,
-                                "algorithm.copd.episode_hint_teacher_advantage_w",
-                            )
-                            if not copd_teacher_adv_enabled:
-                                episode_hint_teacher_advantage_w = 0.0
-                            elif episode_hint_teacher_advantage_w is not None:
-                                episode_hint_teacher_advantage_w = float(episode_hint_teacher_advantage_w)
                             step_hint_teacher_advantage_w = (
                                 float(OmegaConf.select(self.config, "algorithm.copd.step_hint_teacher_advantage_w") or 0.0)
                                 if copd_teacher_adv_enabled
                                 else 0.0
                             )
-                            metrics["copd/episode_hint_teacher_advantage_w_current"] = float(
-                                copd_teacher_advantage_w
-                                if episode_hint_teacher_advantage_w is None
-                                else episode_hint_teacher_advantage_w
-                            )
+                            metrics["copd/episode_hint_teacher_advantage_w_current"] = float(episode_hint_teacher_advantage_w)
                             metrics["copd/step_hint_teacher_advantage_w_current"] = float(step_hint_teacher_advantage_w)
                         else:
-                            copd_teacher_advantage_w = 0.0
-                            episode_hint_teacher_advantage_w = None
+                            episode_hint_teacher_advantage_w = 0.0
                             step_hint_teacher_advantage_w = 0.0
 
                         batch = compute_advantage(
@@ -2814,7 +2758,6 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
-                            teacher_advantage_w=copd_teacher_advantage_w,
                             episode_hint_teacher_advantage_w=episode_hint_teacher_advantage_w,
                             step_hint_teacher_advantage_w=step_hint_teacher_advantage_w,
                             copd_mode=self.config.algorithm.copd.mode,

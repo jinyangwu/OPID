@@ -257,13 +257,11 @@ algorithm:
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
   copd:
     step_advantage_w: 0.0 # COPD uses episode-level advantage only; SOPD may set this >0 to keep GiGPO step advantage.
-    teacher_advantage_w: 1.0
-    episode_hint_teacher_advantage_w: null # null -> use teacher_advantage_w; otherwise override episode-hint teacher weight
+    episode_hint_teacher_advantage_w: 1.0 # separate weight for episode-hint teacher signal
     step_hint_teacher_advantage_w: 0.0 # separate weight for step-hint-only teacher signal
+    hint_teacher_mode: "step_priority" # "step_priority" uses episode hints only where no step hint is active; "additive" scores both prompts and adds both advantages
     opd_start_after_steps: null # null -> enable COPD teacher/OPD signal from the first training step; otherwise enable after this many completed steps
-    teacher_advantage_w_start: null # null -> keep teacher_advantage_w constant; otherwise linearly ramp from start to teacher_advantage_w
-    teacher_advantage_w_ramp_steps: null # null -> use remaining trainer.total_training_steps after opd_start_after_steps for the ramp length
-    phase_switch_after_steps: null
+    opd_stop_after_steps: null # null -> keep COPD teacher/OPD signal enabled; otherwise disable after this many completed steps
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False
@@ -350,5 +348,4 @@ env:
   sciworld:
     generalization_level: 0
     simplifications_preset: easy
-    env_step_limit: 50
     jar_path: null

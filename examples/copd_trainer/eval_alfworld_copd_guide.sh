@@ -7,20 +7,21 @@ ulimit -u 65536
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
-MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}
+if [ -z "${MODEL_PATH:-}" ]; then
+    MODELS_ROOT=${MODELS_ROOT:?Please set MODEL_PATH or MODELS_ROOT}
+    MODEL_PATH=$MODELS_ROOT/release/opid_3b_alfworld_step150
+fi
 TRAIN_DATA_SIZE=16
 VAL_DATA_SIZE=128
 GROUP_SIZE=8
-NUM_CPUS_PER_ENV_WORKER=${NUM_CPUS_PER_ENV_WORKER:-0.2}
-
-history_length=5
+NUM_CPUS_PER_ENV_WORKER=0.1
 
 # COPD advantage and teacher/OPD signal schedule.
 COPD_MODE=mean_norm
 COPD_STEP_ADV_W=0.0
 COPD_EPISODE_HINT_TEACHER_ADV_W=${COPD_EPISODE_HINT_TEACHER_ADV_W:-0.001}
 COPD_STEP_HINT_TEACHER_ADV_W=${COPD_STEP_HINT_TEACHER_ADV_W:-0.001}
+COPD_HINT_TEACHER_MODE=${COPD_HINT_TEACHER_MODE:-step_priority}
 COPD_OPD_START_AFTER_STEPS=${COPD_OPD_START_AFTER_STEPS:-null}
 COPD_OPD_STOP_AFTER_STEPS=${COPD_OPD_STOP_AFTER_STEPS:-null}
 
@@ -36,9 +37,13 @@ COPD_ANALYSIS_BACKEND=openai
 COPD_ANALYSIS_NUM_WORKERS=128
 COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ=${COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ:-5}
 
-PROJECT_NAME=agentic_sciworld
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_3b_sciworld_llm-5_episode-step-hint-v3_opd-adv-0.001}
-DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
+# Experiment naming and output location.
+PROJECT_NAME=agentic_alfworld
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-eval-copd-grpo_alfworld}
+DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-}
+
+# Prompt observation history.
+history_length=5
 
 python3 -m examples.data_preprocess.prepare \
     --mode text \
@@ -51,7 +56,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$TRAIN_DATA_SIZE \
     data.val_batch_size=$VAL_DATA_SIZE \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=2048 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation=left \
@@ -101,21 +106,25 @@ python3 -m verl.trainer.main_ppo \
     algorithm.copd.analysis_max_step_hints_per_traj=$COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ \
     algorithm.copd.normalize_teacher_adv=False \
     env.history_length=$history_length \
-    env.env_name=sciworld \
+    env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \
     env.max_steps=30 \
     env.rollout.n=$GROUP_SIZE \
     env.resources_per_worker.num_cpus=$NUM_CPUS_PER_ENV_WORKER \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=160 \
-    trainer.val_before_train=False \
+    trainer.save_freq=-1 \
+    trainer.test_freq=-1 \
+    trainer.total_epochs=1 \
+    trainer.total_training_steps=0 \
+    trainer.val_before_train=True \
+    trainer.val_only=True \
+    trainer.resume_mode=disable \
     trainer.default_local_dir=$DEFAULT_LOCAL_DIR \
-    trainer.rollout_data_dir=$DEFAULT_LOCAL_DIR \
+    trainer.rollout_data_dir=null \
+    trainer.validation_data_dir=null \
     $@

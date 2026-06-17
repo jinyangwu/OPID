@@ -358,7 +358,6 @@ def summarize_copd_advantage_components(
     step_advantages: torch.Tensor,
     teacher_advantages: torch.Tensor,
     step_advantage_w: float = 0.0,
-    teacher_advantage_w: float = 1.0,
     epsilon: float = 1e-6,
 ) -> Dict[str, float]:
     """
@@ -368,7 +367,7 @@ def summarize_copd_advantage_components(
     component over valid response tokens:
         episode_adv
         step_advantage_w * step_adv
-        teacher_advantage_w * teacher_adv
+        teacher_adv
     """
     valid_mask = response_mask > 0
     def _summarize(prefix: str, components: Dict[str, torch.Tensor]) -> Dict[str, float]:
@@ -415,7 +414,7 @@ def summarize_copd_advantage_components(
     weighted_components = {
         "episode": episode_advantages,
         "step": step_advantage_w * step_advantages,
-        "teacher": teacher_advantage_w * teacher_advantages,
+        "teacher": teacher_advantages,
     }
 
     teacher_active_token_ratio = float(
@@ -429,7 +428,6 @@ def summarize_copd_advantage_components(
     metrics.update({
         "copd/adv/teacher_active_token_ratio": teacher_active_token_ratio,
         "copd/adv/step_weight": float(step_advantage_w),
-        "copd/adv/teacher_weight": float(teacher_advantage_w),
     })
     return metrics
 
@@ -449,8 +447,7 @@ def compute_copd_advantage_components(
     step_hint_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
     epsilon: float = 1e-6,
     step_advantage_w: float = 0.0,
-    teacher_advantage_w: float = 1.0,
-    episode_hint_teacher_advantage_w: Optional[float] = None,
+    episode_hint_teacher_advantage_w: float = 1.0,
     step_hint_teacher_advantage_w: float = 0.0,
     mode: str = "mean_norm",
     enable_similarity: bool = False,
@@ -460,7 +457,7 @@ def compute_copd_advantage_components(
     metrics_prefix: str = "copd/state_group",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     """
-    Compute episode-level COPD advantages plus an optional episode-level teacher term.
+    Compute COPD advantages with independently weighted episode- and step-hint teacher terms.
     """
     remove_std = _mode_to_remove_std(mode)
 
@@ -486,11 +483,7 @@ def compute_copd_advantage_components(
     else:
         step_advantages = torch.zeros_like(episode_advantages)
         step_group_metrics: Dict[str, float] = {}
-    episode_hint_weight = (
-        float(teacher_advantage_w)
-        if episode_hint_teacher_advantage_w is None
-        else float(episode_hint_teacher_advantage_w)
-    )
+    episode_hint_weight = float(episode_hint_teacher_advantage_w or 0.0)
     step_hint_weight = float(step_hint_teacher_advantage_w or 0.0)
 
     episode_teacher_advantages = compute_teacher_token_advantage(
@@ -584,8 +577,7 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
                                    step_hint_mask: Optional[torch.Tensor | np.ndarray | Sequence] = None,
                                    epsilon: float = 1e-6,
                                    step_advantage_w: float = 0.0,
-                                   teacher_advantage_w: float = 1.0,
-                                   episode_hint_teacher_advantage_w: Optional[float] = None,
+                                   episode_hint_teacher_advantage_w: float = 1.0,
                                    step_hint_teacher_advantage_w: float = 0.0,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
@@ -615,7 +607,6 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
         step_hint_mask=step_hint_mask,
         epsilon=epsilon,
         step_advantage_w=step_advantage_w,
-        teacher_advantage_w=teacher_advantage_w,
         episode_hint_teacher_advantage_w=episode_hint_teacher_advantage_w,
         step_hint_teacher_advantage_w=step_hint_teacher_advantage_w,
         mode=mode,
@@ -632,7 +623,6 @@ def compute_copd_outcome_advantage(token_level_rewards: torch.Tensor,
             step_advantages=step_advantages,
             teacher_advantages=teacher_advantages,
             step_advantage_w=step_advantage_w,
-            teacher_advantage_w=1.0,
             epsilon=epsilon,
         )
         component_metrics.update(step_group_metrics)

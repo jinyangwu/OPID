@@ -17,13 +17,26 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+
+def compute_subtask_success_rate_mean(success_rates: Dict[str, Any]) -> Optional[float]:
+    """Compute the macro average over available subtask success rates."""
+    subtask_success_rates = [
+        float(value)
+        for key, value in success_rates.items()
+        if key != "success_rate" and key.endswith("_success_rate")
+    ]
+    if not subtask_success_rates:
+        return None
+    return float(np.mean(subtask_success_rates))
+
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:

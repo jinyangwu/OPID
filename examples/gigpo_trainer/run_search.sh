@@ -8,23 +8,23 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct}
-TRAIN_DATA_SIZE=256
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}
+TRAIN_DATA_SIZE=128
 VAL_DATA_SIZE=512
-GROUP_SIZE=5
+GROUP_SIZE=8
 
 TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
 
 # GiGPO advantage.
-GIGPO_MODE=mean_std_norm
-GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-1.0}
+GIGPO_MODE=mean_norm
+GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 GIGPO_ENABLE_SIMILARITY=True
 GIGPO_SIMILARITY_THRESH=0.9
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_search
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-gigpo_qwen2.5_7b_search_sim0.9}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_search}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -85,9 +85,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
-    trainer.test_freq=50 \
-    trainer.total_epochs=1 \
+    trainer.save_freq=150 \
+    trainer.test_freq=150 \
+    trainer.total_training_steps=150 \
     trainer.val_before_train=False \
     trainer.default_local_dir=$DEFAULT_LOCAL_DIR \
     trainer.rollout_data_dir=$DEFAULT_LOCAL_DIR \

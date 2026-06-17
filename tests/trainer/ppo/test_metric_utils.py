@@ -25,6 +25,7 @@ from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
+    compute_subtask_success_rate_mean,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -66,6 +67,25 @@ class TestReduceMetrics(unittest.TestCase):
         result = reduce_metrics(metrics)
         
         self.assertEqual(result["single"], 5.0)
+
+
+class TestComputeSubtaskSuccessRateMean(unittest.TestCase):
+    def test_computes_macro_average_over_subtasks(self):
+        success_rates = {
+            "success_rate": 0.6,
+            "pick_and_place_success_rate": 0.25,
+            "pick_clean_then_place_in_recep_success_rate": 0.75,
+        }
+
+        self.assertEqual(compute_subtask_success_rate_mean(success_rates), 0.5)
+
+    def test_ignores_non_subtask_metrics(self):
+        success_rates = {
+            "success_rate": 0.6,
+            "webshop_task_score (not success_rate)": 0.9,
+        }
+
+        self.assertIsNone(compute_subtask_success_rate_mean(success_rates))
 
 
 class TestComputeDataMetrics(unittest.TestCase):

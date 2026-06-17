@@ -1107,7 +1107,7 @@ def make_envs(config):
             variations_idx = json.load(f)
 
         simplifications_preset = config.env.sciworld.get('simplifications_preset', "easy")
-        env_step_limit = config.env.sciworld.get('env_step_limit', 50)
+        env_step_limit = config.env.sciworld.get('env_step_limit', 100)
         jar_path = config.env.sciworld.get('jar_path', None)
 
         _envs = build_sciworld_envs(

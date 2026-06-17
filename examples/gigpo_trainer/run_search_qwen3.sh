@@ -8,7 +8,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen3-1.7B}
 TRAIN_DATA_SIZE=128
 VAL_DATA_SIZE=512
 GROUP_SIZE=8
@@ -16,36 +16,22 @@ GROUP_SIZE=8
 TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
 
-# COPD advantage and teacher/OPD signal schedule.
-COPD_MODE=mean_std_norm
-COPD_STEP_ADV_W=0.0
-COPD_EPISODE_HINT_TEACHER_ADV_W=${COPD_EPISODE_HINT_TEACHER_ADV_W:-0.001}
-COPD_STEP_HINT_TEACHER_ADV_W=${COPD_STEP_HINT_TEACHER_ADV_W:-0.001}
-COPD_OPD_START_AFTER_STEPS=${COPD_OPD_START_AFTER_STEPS:-null}
-COPD_OPD_STOP_AFTER_STEPS=${COPD_OPD_STOP_AFTER_STEPS:-null}
-
-# COPD episode filtering and teacher prompt construction.
-COPD_FAILED_ONLY=${COPD_FAILED_ONLY:-False}
-COPD_FAILED_ONLY_AFTER_STEPS=${COPD_FAILED_ONLY_AFTER_STEPS:-null}
-COPD_FAILURE_SUCCESS_THRESHOLD=${COPD_FAILURE_SUCCESS_THRESHOLD:-1.0}
-
-# COPD episode + critical-step hint analysis.
-COPD_ENABLE_ANALYSIS=${COPD_ENABLE_ANALYSIS:-True}
-COPD_SELECTOR=${COPD_SELECTOR:-llm}
-COPD_ANALYSIS_BACKEND=openai
-COPD_ANALYSIS_NUM_WORKERS=128
-COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ=${COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ:-1}
+# GiGPO advantage.
+GIGPO_MODE=mean_norm
+GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
+GIGPO_ENABLE_SIMILARITY=True
+GIGPO_SIMILARITY_THRESH=0.9
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_search
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_3b_search_llm-1_episode-step-hint-plus-v3_opd-adv-0.001_exp1-mean-std-norm-flash}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen3_1.7b_search_sim0.9_mean-norm}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
 history_length=4
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=copd \
+    algorithm.adv_estimator=gigpo \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \
     data.train_batch_size=$TRAIN_DATA_SIZE \
@@ -55,6 +41,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation=left \
     data.return_raw_chat=True \
+    +data.apply_chat_template_kwargs.enable_thinking=False \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
@@ -65,12 +52,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.opd_loss_coef=0.0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -84,22 +70,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.01 \
     algorithm.use_kl_in_reward=False \
     algorithm.gamma=0.95 \
-    algorithm.copd.step_advantage_w=$COPD_STEP_ADV_W \
-    algorithm.copd.episode_hint_teacher_advantage_w=$COPD_EPISODE_HINT_TEACHER_ADV_W \
-    algorithm.copd.step_hint_teacher_advantage_w=$COPD_STEP_HINT_TEACHER_ADV_W \
-    algorithm.copd.opd_start_after_steps=$COPD_OPD_START_AFTER_STEPS \
-    algorithm.copd.opd_stop_after_steps=$COPD_OPD_STOP_AFTER_STEPS \
-    algorithm.copd.failed_only=$COPD_FAILED_ONLY \
-    algorithm.copd.failed_only_after_steps=$COPD_FAILED_ONLY_AFTER_STEPS \
-    algorithm.copd.failure_success_threshold=$COPD_FAILURE_SUCCESS_THRESHOLD \
-    algorithm.copd.mode=$COPD_MODE \
-    algorithm.copd.enable_analysis=$COPD_ENABLE_ANALYSIS \
-    algorithm.copd.selector=$COPD_SELECTOR \
-    algorithm.copd.analysis_backend=$COPD_ANALYSIS_BACKEND \
-    algorithm.copd.analysis_num_workers=$COPD_ANALYSIS_NUM_WORKERS \
-    algorithm.copd.analysis_max_completion_tokens=4096 \
-    algorithm.copd.analysis_max_step_hints_per_traj=$COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ \
-    algorithm.copd.normalize_teacher_adv=False \
+    algorithm.gigpo.step_advantage_w=$GIGPO_STEP_ADV_W \
+    algorithm.gigpo.mode=$GIGPO_MODE \
+    algorithm.gigpo.enable_similarity=$GIGPO_ENABLE_SIMILARITY \
+    algorithm.gigpo.similarity_thresh=$GIGPO_SIMILARITY_THRESH \
     env.history_length=$history_length \
     env.env_name=search \
     env.seed=0 \

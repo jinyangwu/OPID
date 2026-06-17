@@ -1,5 +1,24 @@
 import re
-from typing import Any, Sequence
+from typing import Any, Sequence, Tuple
+
+
+HINT_TEACHER_MODES = ("step_priority", "additive")
+
+
+def select_hint_teacher_sources(
+    *,
+    step_hint: str,
+    episode_hint_enabled: bool,
+    step_hint_enabled: bool,
+    mode: str = "step_priority",
+) -> Tuple[bool, bool]:
+    """Return whether to score the episode-hint and step-hint prompts."""
+    if mode not in HINT_TEACHER_MODES:
+        raise ValueError(f"Unsupported COPD hint_teacher_mode: {mode}")
+
+    use_step_hint = bool(str(step_hint).strip()) and step_hint_enabled
+    use_episode_hint = episode_hint_enabled and (mode == "additive" or not use_step_hint)
+    return use_episode_hint, use_step_hint
 
 
 def build_augmented_observation_text(

@@ -1,4 +1,6 @@
-from agent_system.memory.episode_hint import build_augmented_observation_text
+import pytest
+
+from agent_system.memory.episode_hint import build_augmented_observation_text, select_hint_teacher_sources
 
 
 PROMPT = """You are an expert autonomous agent.
@@ -41,3 +43,40 @@ def test_augmented_observation_without_episode_hint_is_unchanged():
     )
 
     assert augmented == PROMPT
+
+
+def test_step_priority_uses_only_step_hint_when_available():
+    assert select_hint_teacher_sources(
+        step_hint="Check the receptacle first.",
+        episode_hint_enabled=True,
+        step_hint_enabled=True,
+        mode="step_priority",
+    ) == (False, True)
+
+
+def test_additive_uses_episode_and_step_hints_when_available():
+    assert select_hint_teacher_sources(
+        step_hint="Check the receptacle first.",
+        episode_hint_enabled=True,
+        step_hint_enabled=True,
+        mode="additive",
+    ) == (True, True)
+
+
+def test_additive_uses_only_episode_hint_without_step_hint():
+    assert select_hint_teacher_sources(
+        step_hint="",
+        episode_hint_enabled=True,
+        step_hint_enabled=True,
+        mode="additive",
+    ) == (True, False)
+
+
+def test_hint_teacher_mode_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unsupported COPD hint_teacher_mode"):
+        select_hint_teacher_sources(
+            step_hint="hint",
+            episode_hint_enabled=True,
+            step_hint_enabled=True,
+            mode="unknown",
+        )

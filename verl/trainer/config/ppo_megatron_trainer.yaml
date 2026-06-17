@@ -296,13 +296,11 @@ algorithm:
     similarity_thresh: 0.95
   copd:
     step_advantage_w: 0.0 # SOPD may set this >0 to keep GiGPO step advantage.
-    teacher_advantage_w: 1.0
-    episode_hint_teacher_advantage_w: null
+    episode_hint_teacher_advantage_w: 1.0
     step_hint_teacher_advantage_w: 0.0
+    hint_teacher_mode: "step_priority"
     opd_start_after_steps: null
-    teacher_advantage_w_start: null
-    teacher_advantage_w_ramp_steps: null
-    phase_switch_after_steps: null
+    opd_stop_after_steps: null
     mode: "mean_norm"
     enable_analysis: True # False skips COPD analysis and teacher signal construction while keeping the COPD estimator
     enable_similarity: False

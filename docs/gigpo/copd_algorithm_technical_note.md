@@ -511,6 +511,8 @@ Input:
 | `algorithm.adv_estimator` | `copd` | 使用 COPD advantage estimator |
 | `algorithm.copd.mode` | `mean_norm` | 组内只减均值，不除标准差 |
 | `algorithm.copd.step_advantage_w` | `0.0` | 关闭 GiGPO step advantage |
+| `algorithm.copd.episode_hint_teacher_advantage_w` | `0.001` | episode-hint teacher signal 独立权重 |
+| `algorithm.copd.step_hint_teacher_advantage_w` | `0.001` | step-hint teacher signal 独立权重 |
 | `algorithm.copd.enable_analysis` | `True` | 开启 LLM 轨迹分析 |
 | `algorithm.copd.selector` | `llm` | 使用 LLM JSON analyzer |
 | `algorithm.copd.analysis_backend` | `openai` | 使用 OpenAI-compatible 后端 |
@@ -518,7 +520,7 @@ Input:
 | `algorithm.copd.analysis_max_step_hints_per_traj` | `5` | 每条轨迹最多保留 5 个 step hints |
 | `algorithm.copd.failed_only` | `False` | 成功和失败轨迹都分析 |
 | `algorithm.copd.opd_start_after_steps` | `null` | 从训练开始即允许 teacher signal |
-| `algorithm.copd.phase_switch_after_steps` | `null` | 不设置 teacher signal 关闭阶段 |
+| `algorithm.copd.opd_stop_after_steps` | `null` | 不设置 teacher signal 停止步数 |
 | `actor_rollout_ref.actor.opd_loss_coef` | `0.0` | 不使用 auxiliary OPD loss |
 
 ## 14. 实现映射
@@ -573,9 +575,10 @@ $$
 4. LLM analysis 的质量会直接影响 teacher delta。解析器能处理 JSON 失败并
    重试，但无法保证 hint 在语义上总是高质量。
 
-5. 当前 AlfWorld 配置中 teacher 权重为 \(10^{-3}\)，因此主导项仍然是
-   episode outcome advantage。训练时应关注日志中的 `copd/adv/*` 指标，
-   尤其是 episode、step、teacher 三类分量的绝对均值和 share。
+5. 当前 AlfWorld 配置中 episode-hint 和 step-hint teacher 权重均为
+   \(10^{-3}\)，因此主导项仍然是 episode outcome advantage。训练时应关注
+   日志中的 `copd/adv/*` 指标，尤其是 episode、step、teacher 三类分量的
+   绝对均值和 share。
 
 6. LLM 分析按 trajectory 发起请求，成本由 rollout batch 中的轨迹数量、
    `analysis_num_workers` 和 `analysis_max_completion_tokens` 共同决定。
