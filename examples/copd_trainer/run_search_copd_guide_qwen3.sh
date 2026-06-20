@@ -38,7 +38,7 @@ COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ=${COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ:-1
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_search
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen3_1.7b_search_llm-1_episode-step-hint-plus-v3_opd-adv-0.001_exp1-mean-std-norm-flash}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen3_1.7b_search_llm-1_episode-step-hint-plus-v3_opd-adv-0.001_exp1-mean-std-norm-glm-5.2}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -116,7 +116,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=150 \
     trainer.test_freq=150 \
     trainer.total_training_steps=150 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.default_local_dir=$DEFAULT_LOCAL_DIR \
     trainer.rollout_data_dir=$DEFAULT_LOCAL_DIR \
     $@

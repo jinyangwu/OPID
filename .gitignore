@@ -4,6 +4,7 @@ run.sh
 test_api.py
 test_webshop.py
 
+case
 past
 **/*.pyc
 **/*.whl
