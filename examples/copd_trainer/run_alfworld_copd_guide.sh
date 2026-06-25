@@ -36,7 +36,7 @@ COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ=${COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ:-5
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_alfworld
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_3b_alfworld_llm-5_episode-step-hint-v3_opd-adv-0.001_exp1-qwen3.5-27b}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_3b_alfworld_llm-5_episode-step-hint-v3_opd-adv-0.001_exp2-ds-v32-50}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -105,7 +105,7 @@ python3 -m verl.trainer.main_ppo \
     env.history_length=$history_length \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \
-    env.max_steps=30 \
+    env.max_steps=50 \
     env.rollout.n=$GROUP_SIZE \
     env.resources_per_worker.num_cpus=$NUM_CPUS_PER_ENV_WORKER \
     trainer.critic_warmup=0 \

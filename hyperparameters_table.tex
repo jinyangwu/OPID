@@ -1,0 +1,66 @@
+% Hyperparameter table compiled from:
+% - case/experiment_details.md
+% - examples/copd_trainer/run_*_copd_guide*.sh
+% - verl/trainer/config/ppo_trainer.yaml
+% Requires: \usepackage{booktabs}
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.15}
+\caption{RL training hyperparameters.}
+\label{tab:rl_hyperparameters}
+\begin{tabular}{@{}p{0.32\textwidth}p{0.63\textwidth}@{}}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Backbones
+& \texttt{Qwen3-1.7B} for ALFWorld, WebShop, and Search; \texttt{Qwen2.5-3B-Instruct} for ScienceWorld. \\
+
+Training update steps
+& 160 updates for ALFWorld, ScienceWorld, and WebShop; 150 updates for Search. \\
+
+Training batch size
+& 16 for ALFWorld, ScienceWorld, and WebShop; 128 for Search. \\
+
+Rollout group size $N$
+& 8. \\
+
+Actor optimizer and learning rate
+& AdamW with learning rate $1\times10^{-6}$ and weight decay $0.01$. \\
+
+PPO/GRPO clip parameter $\epsilon$
+& $0.2$ for both lower and upper policy-ratio clipping. \\
+
+Skill coefficient $\lambda_{\mathrm{skill}}$
+& $0.001$ for episode-level skill teacher advantage and $0.001$ for critical-step skill teacher advantage; auxiliary OPD loss coefficient is 0. \\
+
+KL regularization
+& Low-variance KL loss on the actor. KL coefficient is 0.01 for ALFWorld, ScienceWorld, and WebShop, and 0.001 for Search; KL-in-reward is disabled. \\
+
+Policy-update epochs / minibatches
+& 1 policy epoch. PPO minibatch size is 256 for ALFWorld and ScienceWorld, 64 for WebShop, and 512 for Search; per-GPU microbatch size is 32, 32, 8, and 16 respectively. \\
+
+Rollout decoding
+& vLLM rollout with sampling enabled; temperature 0.4, top-$p$ 1.0, and top-$k$ -1. \\
+
+Maximum prompt / response lengths
+& Prompt length is 2,048 for ALFWorld and 4,096 for ScienceWorld, WebShop, and Search; response length is 512 for all tasks. \\
+
+Maximum environment steps
+& 30 for ALFWorld and ScienceWorld, 15 for WebShop, and 4 for Search. \\
+
+Gradient clipping
+& Global gradient norm clipped to 1.0. \\
+
+Precision and distributed strategy
+& bfloat16 rollout dtype with FSDP actor/ref/critic workers. Scripts use one node with 8 GPUs; vLLM tensor parallel size is 1 except WebShop, where it is 4. \\
+
+Reward definition during training
+& ALFWorld and ScienceWorld use sparse completion reward $10\cdot\mathbb{1}[\mathrm{success}]$; WebShop maps successful terminal episodes to 10 and otherwise 0; Search uses exact-match QA reward, 1 for a correct final answer and 0 otherwise. \\
+
+Random seeds
+& Environment seed 0. \\
+\bottomrule
+\end{tabular}
+\end{table*}

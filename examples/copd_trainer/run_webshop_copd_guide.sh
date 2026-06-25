@@ -8,7 +8,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct}
 TRAIN_DATA_SIZE=16
 VAL_DATA_SIZE=128
 GROUP_SIZE=8
@@ -36,7 +36,7 @@ COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ=${COPD_ANALYSIS_MAX_STEP_HINTS_PER_TRAJ:-5
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_3b_webshop_llm-5_step-hint-plus-v3_opd-adv-0.001_exp12-glm-5.2}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-copd-grpo_qwen2.5_7b_webshop_llm-5_step-hint-plus-v3_opd-adv-0.001_exp123-glm-5.2}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.

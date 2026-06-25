@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>COPD Analyser Prompt</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #5d6978;
+      --line: #d8dee8;
+      --panel: #f7f9fc;
+      --accent: #1f6feb;
+      --accent-soft: #eaf2ff;
+      --code: #0f172a;
+      --code-bg: #f1f5f9;
+      --success: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #ffffff;
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 34px 28px 48px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 18px;
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 28px 0 12px;
+      font-size: 20px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      line-height: 1.25;
+      letter-spacing: 0;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    p {
+      margin: 0;
+      max-width: 860px;
+      color: var(--muted);
+    }
+
+    .source {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 12px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 310px;
+      gap: 22px;
+      align-items: start;
+    }
+
+    .side {
+      border-left: 3px solid var(--accent);
+      padding-left: 16px;
+    }
+
+    .note {
+      margin-bottom: 18px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+
+    .note strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--ink);
+    }
+
+    ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    li + li {
+      margin-top: 6px;
+    }
+
+    code,
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    pre {
+      margin: 0;
+      padding: 18px;
+      overflow: auto;
+      white-space: pre-wrap;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--code-bg);
+      color: var(--code);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .prompt {
+      border-top: 4px solid var(--accent);
+    }
+
+    .schema {
+      border-top: 4px solid var(--success);
+    }
+
+    .chip-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: #174ea6;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    .section {
+      margin-top: 24px;
+    }
+
+    @media (max-width: 860px) {
+      main {
+        padding: 24px 16px 36px;
+      }
+
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .side {
+        border-left: none;
+        padding-left: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>COPD Analyser Prompt</h1>
+      <p>
+        HTML rendering of the current episode analysis prompt used by
+        <code>COPDEpisodeAnalyzer</code>. Dynamic fields are shown as template
+        placeholders so the prompt can be read independently from a concrete trajectory.
+      </p>
+      <div class="source">Source: gigpo/copd.py::_build_episode_analysis_prompt</div>
+    </header>
+
+    <section class="layout" aria-label="Main analyser prompt">
+      <div>
+        <h2>Episode Analysis Prompt</h2>
+        <pre class="prompt">Analyze the following agent episode and return ONLY valid JSON.
+
+You need to complete all three fields:
+1. Write a concise episode_summary.
+2. {episode_hint_instruction}
+3. Provide concise, action-oriented decision guidance for at most {max_hint_count} critical step(s) from the candidate set as entries in step_hints; use the full episode to infer the guidance, but phrase each hint as advice the policy can act on at that step.
+
+Important constraints:
+- Step indexing is 0-based: step 0 is the first step of the trajectory.
+- Use the task description together with the episode context to judge progress and mistakes.
+- Use the full episode context to identify what each critical step should have done better.
+- Each step_hints value should be one short imperative sentence for the policy at that step.
+- Write step_hints as policy-facing guidance, not as retrospective explanation of the trajectory.
+- Return only these top-level fields: episode_summary, episode_hint, step_hints.
+- The chosen steps are exactly the keys present in step_hints.
+
+Return format:
+{
+  "episode_summary": "string",
+  "episode_hint": "string",
+  "step_hints": {
+    "0": "hint for step 0",
+    "2": "hint for step 2"
+  }
+}
+
+Episode context:
+- Task description: {task_description_or_not_available}
+- episode_success: {outcome_label}
+- Candidate step indices: {candidate_step_indices}
+- Interaction trajectory: {formatted_episode_steps}</pre>
+      </div>
+
+      <aside class="side" aria-label="Prompt notes">
+        <div class="note">
+          <strong>Dynamic placeholders</strong>
+          <div class="chip-list">
+            <span class="chip">{episode_hint_instruction}</span>
+            <span class="chip">{max_hint_count}</span>
+            <span class="chip">{task_description}</span>
+            <span class="chip">{outcome_label}</span>
+            <span class="chip">{candidate_step_indices}</span>
+            <span class="chip">{formatted_episode_steps}</span>
+          </div>
+        </div>
+
+        <div class="note">
+          <strong>Outcome-conditioned episode hint</strong>
+          <ul>
+            <li><code>success</code>: extract the successful workflow, decision rule, and action ordering.</li>
+            <li><code>failure</code>: extract avoidance rules, core mistakes, and warning signs.</li>
+            <li><code>unknown</code>: infer whether to produce workflow or avoidance guidance.</li>
+          </ul>
+        </div>
+
+        <div class="note">
+          <strong>JSON contract</strong>
+          <ul>
+            <li>Return only valid JSON.</li>
+            <li>Use exactly three top-level fields.</li>
+            <li>Step hint keys are the selected 0-based indices.</li>
+          </ul>
+        </div>
+      </aside>
+    </section>
+
+    <section class="section" aria-label="Episode hint variants">
+      <h2>Episode Hint Instructions</h2>
+      <div class="layout">
+        <pre>Success:
+Write one episode_hint that extracts the successful trajectory into workflow: the core decision rule and action ordering that made this trajectory work.
+
+Failure:
+Write one episode_hint that extracts the failed trajectory into avoidance rules: the core mistake and warning signs that agent should avoid.
+
+Unknown:
+Write one episode_hint distilled from the trajectory. If it succeeded, extract the successful workflow; if it failed, extract the avoidance rules.</pre>
+        <pre class="schema">{
+  "episode_summary": "string",
+  "episode_hint": "string",
+  "step_hints": {
+    "0": "hint for step 0",
+    "2": "hint for step 2"
+  }
+}</pre>
+      </div>
+    </section>
+
+    <section class="section" aria-label="Singleton analyser prompt">
+      <h2>SOPD Singleton Prompt</h2>
+      <pre class="prompt">You are producing SOPD (Singleton OPD) guidance for an on-policy agent trajectory.
+
+SOPD assumption:
+- Every candidate singleton step is treated as a key training step.
+- Do not select a subset. Produce guidance for every candidate singleton step.
+- The guidance may reinforce the observed decision or correct it, depending on the full trajectory context.
+
+Your output must contain exactly two top-level fields:
+1. "episode_summary"
+2. "step_hints"
+
+# Task requirements
+- Write a concise episode_summary describing what the trajectory did.
+- For every candidate singleton step, write exactly one short action-oriented step hint for what the policy should do at that key step.
+
+# Rules for step_hints
+- Step indices are 0-based.
+- The "step_hints" object must contain every candidate singleton step index exactly once.
+- The only allowed step_hints keys are: {candidate_singleton_step_indices}
+- Do not omit any candidate singleton step.
+- Each hint must be a single short imperative sentence the policy can act on at that step.
+- Write policy-facing guidance, not retrospective narration.
+
+# Style requirements
+- Keep episode_summary concise and factual.
+- Keep each step hint specific, actionable, and brief.
+- Do not output markdown, code fences, or any text outside the JSON object.
+
+# Output schema
+{
+  "episode_summary": "string",
+  "step_hints": {
+    "0": "short key-step hint for step 0",
+    "2": "short key-step hint for step 2"
+  }
+}
+
+Episode context:
+- Task description: {task_description_or_not_available}
+- Candidate singleton step indices: {candidate_singleton_step_indices}
+- Interaction trajectory: {formatted_episode_steps}
+
+Return only valid JSON.</pre>
+    </section>
+  </main>
+</body>
+</html>

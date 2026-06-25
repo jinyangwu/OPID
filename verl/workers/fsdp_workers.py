@@ -144,6 +144,7 @@ class ActorRolloutRefWorker(Worker):
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
+        self._rollout_generation_session_depth = 0
 
         # normalize config
         if self._is_actor:
@@ -640,6 +641,29 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def start_rollout_generation_session(self):
+        assert self._is_rollout
+        if self._rollout_generation_session_depth == 0:
+            self.rollout_sharding_manager.__enter__()
+            log_gpu_memory_usage("After entering rollout generation session", logger=logger)
+        self._rollout_generation_session_depth += 1
+        return self._rollout_generation_session_depth
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stop_rollout_generation_session(self):
+        assert self._is_rollout
+        if self._rollout_generation_session_depth <= 0:
+            return self._rollout_generation_session_depth
+
+        self._rollout_generation_session_depth -= 1
+        if self._rollout_generation_session_depth == 0:
+            try:
+                self.rollout_sharding_manager.__exit__(None, None, None)
+            finally:
+                log_gpu_memory_usage("After exiting rollout generation session", logger=logger)
+        return self._rollout_generation_session_depth
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
@@ -652,15 +676,23 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
-
+        if self._rollout_generation_session_depth > 0:
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
-            
+
             log_gpu_memory_usage("After rollout generation", logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
+        else:
+            with self.rollout_sharding_manager:
+                log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
+
+                prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                output = self.rollout.generate_sequences(prompts=prompts)
+
+                log_gpu_memory_usage("After rollout generation", logger=logger)
+
+                output = self.rollout_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
 
