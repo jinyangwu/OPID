@@ -2,6 +2,13 @@
 OPID: On-Policy Skill Distillation for Agentic Reinforcement Learning
 </h1>
 
+## News
+
+- **2026-06-25**: We released our paper and code.
+
+If you have any questions ❓ or are interested in collaboration 🤝, please feel free to contact me at 
+wu-jy23@mails.tsinghua.edu.cn.
+
 
 ## Overview
 
@@ -24,10 +31,6 @@ outcome-only RL and competitive skill-distillation baselines.
   <br>
   <em>Figure 2: Main results.</em>
 </div>
-
-## News
-
-- **2026-06-25**: We released our paper and code.
 
 ## Installation
 
@@ -189,13 +192,20 @@ Useful OPID parameters:
 See `scripts/model_merger.py` for FSDP/Megatron merge examples using paths under
 `./checkpoints/...`.
 
-## Citation
+## ⭐ Citation
 
-The manuscript is currently under review. Please update this section with the public BibTeX entry
-after release.
+If you find this project useful, welcome to cite us.
 
 ```bibtex
-
+@misc{wu2026opid,
+      title={OPID: On-Policy Skill Distillation for Agentic Reinforcement Learning},
+      author={Shuo Yang and Jinyang Wu and Zhengxi Lu and Yuhao Shen and Fan Zhang and Lang Feng and Shuai Zhang and Haoran Luo and Zheng Lian and Zhengqi Wen and Jianhua Tao},
+      year={2026},
+      eprint={2606.26790},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.26790}, 
+}
 ```
 
 ## Acknowledgement
