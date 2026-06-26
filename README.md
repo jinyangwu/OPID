@@ -18,7 +18,7 @@ OPID: On-Policy Skill Distillation for Agentic Reinforcement Learning
 
 ## News
 
-- **2026-06-25**: We released our paper and code.
+- **2026-06-25**: We have released our paper and code.
 
 If you have any questions ❓ or are interested in collaboration 🤝, please feel free to contact me at 
 wu-jy23@mails.tsinghua.edu.cn.
