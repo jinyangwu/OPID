@@ -2,6 +2,20 @@
 OPID: On-Policy Skill Distillation for Agentic Reinforcement Learning
 </h1>
 
+  <div align="center">
+  <p>
+      <a href="https://arxiv.org/abs/2606.26790">
+        <img src="https://img.shields.io/badge/Paper-arxiv%3A2606.26790-blue" alt="Paper"/>
+      </a>
+      <a href="https://huggingface.co/papers/2606.26790">
+        <img src="https://img.shields.io/badge/Daily%20Paper-huggingface-yellow" alt="HF Paper"/>
+      </a>
+      <!-- <a href="https://huggingface.co/Jinyang23/Maestro-4B">
+        <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Model-Maestro--4B-yellow" alt="Model Checkpoint"/>
+      </a> -->
+    </p>
+  </div>
+
 ## News
 
 - **2026-06-25**: We released our paper and code.
