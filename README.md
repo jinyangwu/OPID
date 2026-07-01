@@ -211,14 +211,11 @@ See `scripts/model_merger.py` for FSDP/Megatron merge examples using paths under
 If you find this project useful, welcome to cite us.
 
 ```bibtex
-@misc{wu2026opid,
-      title={OPID: On-Policy Skill Distillation for Agentic Reinforcement Learning},
-      author={Shuo Yang and Jinyang Wu and Zhengxi Lu and Yuhao Shen and Fan Zhang and Lang Feng and Shuai Zhang and Haoran Luo and Zheng Lian and Zhengqi Wen and Jianhua Tao},
-      year={2026},
-      eprint={2606.26790},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2606.26790}, 
+@article{yang2026opid,
+  title={OPID: On-Policy Skill Distillation for Agentic Reinforcement Learning},
+  author={Yang, Shuo and Wu, Jinyang and Lu, Zhengxi and Shen, Yuhao and Zhang, Fan and Feng, Lang and Zhang, Shuai and Luo, Haoran and Lian, Zheng and Wen, Zhengqi and others},
+  journal={arXiv preprint arXiv:2606.26790},
+  year={2026}
 }
 ```
 
